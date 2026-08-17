@@ -15,6 +15,8 @@ export interface DebugPanelStats {
   animState: UnitAnimState;
   dirX: number;
   camScale: number;
+  mouseWorld: { x: number; y: number };
+  unitWalkable: boolean;
 }
 
 export interface DebugPanelHooks {
@@ -40,7 +42,14 @@ const STATE_LABELS: Record<UnitAnimState, string> = {
 
 export class DebugPanel {
   private readonly statsEls = {} as Record<
-    'renderFps' | 'simStepsPerSec' | 'simTime' | 'animState' | 'dirX' | 'camScale',
+    | 'renderFps'
+    | 'simStepsPerSec'
+    | 'simTime'
+    | 'animState'
+    | 'dirX'
+    | 'camScale'
+    | 'mouseWorld'
+    | 'unitWalkable',
     HTMLElement
   >;
   private posEl!: HTMLElement;
@@ -77,6 +86,8 @@ export class DebugPanel {
     this.statsEls.animState = mkRow('动画状态');
     this.statsEls.dirX = mkRow('朝向');
     this.statsEls.camScale = mkRow('镜头缩放');
+    this.statsEls.mouseWorld = mkRow('鼠标世界坐标');
+    this.statsEls.unitWalkable = mkRow('单位可通行');
     el.appendChild(stats);
 
     // —— shader 特效 ——
@@ -154,9 +165,9 @@ export class DebugPanel {
     const note = document.createElement('div');
     note.className = 'note';
     note.textContent =
+      '阶段 1：程序化战场地图 + 相机（滚轮缩放/拖拽平移/WASD·方向键），边界限制不越界。' +
       '固定时间步长 1/60s：模拟步数/秒 恒为 60，与刷新率无关；渲染每帧插值。' +
-      '演示单位自动巡逻，每约 4.5s 自动攻击一次（命中帧触发闪白+震屏）。' +
-      '滚轮缩放镜头，拖拽平移。';
+      '单位沿主路巡逻，每约 4.5s 自动攻击（命中帧闪白+震屏）。';
     el.appendChild(note);
   }
 
@@ -191,5 +202,7 @@ export class DebugPanel {
     this.statsEls.animState.textContent = STATE_LABELS[s.animState];
     this.statsEls.dirX.textContent = s.dirX > 0 ? '右 (+x)' : '左 (-x)';
     this.statsEls.camScale.textContent = s.camScale.toFixed(2);
+    this.statsEls.mouseWorld.textContent = `(${s.mouseWorld.x.toFixed(1)}, ${s.mouseWorld.y.toFixed(1)})`;
+    this.statsEls.unitWalkable.textContent = s.unitWalkable ? '可通行' : '不可通行';
   }
 }

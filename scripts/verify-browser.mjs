@@ -2,7 +2,8 @@
  * 浏览器验证脚本（scripts/verify-browser.mjs）
  *
  * 用本机 Chrome/Edge（headless + SwiftShader）加载开发服务器页面，
- * 采集 console 错误并截图，用于阶段验收的"画面可运行"检查。
+ * 采集 console 错误、验证固定时间步长/单位移动/像素渲染，
+ * 并 E2E 验证相机交互（滚轮缩放、拖拽平移、边界限制）。
  *
  * 用法：node scripts/verify-browser.mjs [url] [out.png]
  * 依赖：dev server 已在 5173 端口运行；本机装有 Chrome 或 Edge。
@@ -13,7 +14,7 @@ import path from 'node:path';
 import puppeteer from 'puppeteer-core';
 
 const url = process.argv[2] ?? 'http://localhost:5173/';
-const outPng = process.argv[3] ?? path.resolve('stage0_check.png');
+const outPng = process.argv[3] ?? path.resolve('stage1_check.png');
 
 const candidates = [
   process.env.CHROME_PATH,
@@ -37,6 +38,15 @@ const browser = await puppeteer.launch({
   args: ['--disable-gpu', '--enable-unsafe-swiftshader', '--window-size=1280,720', '--no-sandbox'],
 });
 
+const probe = (page) =>
+  page.evaluate(() => (window.__battleScene ? window.__battleScene.debugState() : null));
+
+/** 世界单位 → 屏幕坐标（与场景相机公式一致） */
+const screenOf = (st, wx, wy) => ({
+  x: (wx * 28 - st.camera.offset.x) * st.camera.scale,
+  y: (wy * 28 - st.camera.offset.y) * st.camera.scale,
+});
+
 try {
   const page = await browser.newPage();
   await page.setViewport({ width: 1280, height: 720 });
@@ -53,73 +63,92 @@ try {
 
   // 注：vite HMR 的 websocket 使 networkidle 永不满足，用 load 即可
   await page.goto(url, { waitUntil: 'load', timeout: 20000 });
-
-  // 等待若干帧渲染（固定时间步长 + 动画）
   await new Promise((r) => setTimeout(r, 2500));
 
-  await page.screenshot({ path: outPng });
-
-  // 读取面板统计（验证固定时间步长与动画状态机在浏览器中真实运行）
-  const stats = await page.evaluate(() => {
-    const panel = document.getElementById('debug-panel');
-    if (!panel) return null;
-    const rows = [...panel.querySelectorAll('.row')].map((r) =>
-      r.textContent ? r.textContent.trim().replace(/\s+/g, ' ') : '',
-    );
-    return rows;
-  });
-  console.log('[verify] 面板统计:');
-  for (const row of stats ?? []) console.log('   ' + row);
-
-  // 运行时探针：两次采样验证单位确实在移动（固定步长推进 + 巡逻）
-  const probe1 = await page.evaluate(() =>
-    (window.__battleScene ? window.__battleScene.debugState() : null),
-  );
+  // —— 固定时间步长 + 单位移动 ——
+  const p1 = await probe(page);
   await new Promise((r) => setTimeout(r, 1500));
-  const probe2 = await page.evaluate(() =>
-    (window.__battleScene ? window.__battleScene.debugState() : null),
-  );
-  console.log('[verify] 视图探针:', JSON.stringify(probe2?.view ?? null));
-  if (probe1 && probe2) {
-    const moved =
-      Math.abs(probe2.unitPos.x - probe1.unitPos.x) > 0.01 ||
-      Math.abs(probe2.unitPos.y - probe1.unitPos.y) > 0.01;
-    console.log(`[verify] 探针: simTime ${probe1.simTime.toFixed(2)}s → ${probe2.simTime.toFixed(2)}s, ` +
-      `位置 (${probe1.unitPos.x.toFixed(2)}, ${probe1.unitPos.y.toFixed(2)}) → (${probe2.unitPos.x.toFixed(2)}, ${probe2.unitPos.y.toFixed(2)}), ` +
-      `移动中: ${moved}, 动画: ${probe2.animState}`);
-    if (probe2.simTime <= probe1.simTime) {
+  const p2 = await probe(page);
+  if (p1 && p2) {
+    const moved = Math.abs(p2.unitPos.x - p1.unitPos.x) > 0.01;
+    console.log(
+      `[verify] 模拟: simTime ${p1.simTime.toFixed(2)}s → ${p2.simTime.toFixed(2)}s, ` +
+        `位置 (${p1.unitPos.x.toFixed(2)}, ${p1.unitPos.y.toFixed(2)}) → (${p2.unitPos.x.toFixed(2)}, ${p2.unitPos.y.toFixed(2)}), ` +
+        `步数/秒=${p2.stepsPerSec}, 动画=${p2.animState}`,
+    );
+    if (p2.simTime <= p1.simTime) {
       console.error('[verify] 模拟时间未推进！');
       result = 'errors';
     }
-    if (!moved && probe2.animState === 'walk') {
-      console.error('[verify] walk 状态但位置未移动！');
+    if (!moved) {
+      console.error('[verify] 单位未移动！');
       result = 'errors';
     }
   }
 
-  // 像素级检查：WebGL 画布中单位所在区域是否存在"盔甲蓝调"像素（证明单位已绘制）
+  // —— 相机交互 E2E ——
+  const camBefore = p2?.camera;
+  // 滚轮缩放（以屏幕中心为锚）
+  await page.mouse.move(640, 360);
+  await page.mouse.wheel({ deltaY: -240 }); // 放大
+  await new Promise((r) => setTimeout(r, 400));
+  const camZoomed = await probe(page);
+  // 拖拽平移（向右拖 200px）
+  await page.mouse.move(640, 360);
+  await page.mouse.down();
+  await page.mouse.move(840, 360, { steps: 5 });
+  await page.mouse.up();
+  await new Promise((r) => setTimeout(r, 400));
+  const camPanned = await probe(page);
+
+  if (camBefore && camZoomed && camPanned) {
+    const z = camZoomed.camera;
+    const pn = camPanned.camera;
+    console.log(
+      `[verify] 相机: scale ${camBefore.scale.toFixed(2)} → ${z.scale.toFixed(2)} (滚轮), ` +
+        `offset (${pn.offset.x.toFixed(0)}, ${pn.offset.y.toFixed(0)})`,
+    );
+    if (z.scale <= camBefore.scale) {
+      console.error('[verify] 滚轮放大未生效！');
+      result = 'errors';
+    }
+    // 拖拽向右 → pan(+dx) → offset.x 减小（若已触底则不变）
+    if (pn.offset.x > z.offset.x + 0.01) {
+      console.error(`[verify] 拖拽平移方向错误（offset.x ${z.offset.x.toFixed(1)} → ${pn.offset.x.toFixed(1)}，应减小）！`);
+      result = 'errors';
+    }
+    // 边界限制：offset 必须在地图范围内（地图 1680×1064 px，边距 120）
+    const visW = 1280 / pn.scale;
+    const visH = 720 / pn.scale;
+    const minX = -120;
+    const maxX = 1680 - visW + 120;
+    const minY = -120;
+    const maxY = 1064 - visH + 120;
+    if (pn.offset.x < minX - 0.5 || pn.offset.x > maxX + 0.5 || pn.offset.y < minY - 0.5 || pn.offset.y > maxY + 0.5) {
+      console.error(`[verify] 相机偏移越界! offset=(${pn.offset.x.toFixed(1)}, ${pn.offset.y.toFixed(1)}), 范围 x[${minX.toFixed(0)},${maxX.toFixed(0)}] y[${minY.toFixed(0)},${maxY.toFixed(0)}]`);
+      result = 'errors';
+    }
+  }
+
+  await page.screenshot({ path: outPng });
+
+  // —— 像素检查：单位区域存在盔甲蓝调像素（缩放平移后单位仍正确绘制/贴地） ——
   const pixelCheck = await page.evaluate(() => {
     const canvas = document.getElementById('game-canvas');
-    if (!canvas) return { error: 'no canvas' };
     const gl = canvas.getContext('webgl2') ?? canvas.getContext('webgl');
-    if (!gl) return { error: 'no gl context' };
-    const w = canvas.width;
-    const h = canvas.height;
-    // 单位当前世界坐标（探针给出）→ 屏幕坐标：sx = (wx*28 + 456) * 1.4, sy = (wy*28 + 280) * 1.4
-    const scene = window.__battleScene;
-    if (!scene) return { error: 'no scene' };
-    const st = scene.debugState();
-    const cx = Math.round((st.unitPos.x * 28 + 456) * 1.4);
-    const cy = Math.round((st.unitPos.y * 28 + 280) * 1.4);
-    const rx = 100;
-    const ry = 130;
-    const x0 = Math.max(0, cx - rx);
-    const y0 = Math.max(0, cy - ry);
-    const rw = Math.min(w, cx + rx) - x0;
-    const rh = Math.min(h, cy + ry) - y0;
-    if (rw <= 0 || rh <= 0) return { error: 'region out of bounds' };
+    if (!gl) return { error: 'no gl' };
+    const st = window.__battleScene.debugState();
+    const sx = (st.unitPos.x * 28 - st.camera.offset.x) * st.camera.scale;
+    const sy = (st.unitPos.y * 28 - st.camera.offset.y) * st.camera.scale;
+    const rx = 120;
+    const ry = 140;
+    const x0 = Math.max(0, Math.round(sx - rx));
+    const y0 = Math.max(0, Math.round(sy - ry));
+    const rw = Math.min(canvas.width, Math.round(sx + rx)) - x0;
+    const rh = Math.min(canvas.height, Math.round(sy + ry)) - y0;
+    if (rw <= 0 || rh <= 0) return { error: 'region out of bounds', sx, sy };
     const px = new Uint8Array(rw * rh * 4);
-    gl.readPixels(x0, h - y0 - rh, rw, rh, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    gl.readPixels(x0, canvas.height - y0 - rh, rw, rh, gl.RGBA, gl.UNSIGNED_BYTE, px);
     let bluish = 0;
     let nonBg = 0;
     for (let i = 0; i < px.length; i += 4) {
@@ -127,61 +156,30 @@ try {
       const g = px[i + 1];
       const b = px[i + 2];
       if (Math.abs(r - 18) + Math.abs(g - 36) + Math.abs(b - 24) > 60) nonBg++;
-      if (b > r + 30 && b > 100) bluish++; // 盔甲/金属蓝调
+      if (b > r + 30 && b > 100) bluish++;
     }
-    return { x0, y0, rw, rh, bluish, nonBg, unit: st.unitPos, region: `${cx},${cy}` };
+    return { sx, sy, bluish, nonBg, unit: st.unitPos };
   });
   if (pixelCheck && !pixelCheck.error) {
-    console.log(`[verify] 像素检查: 单位区域(${pixelCheck.region}) 非背景像素=${pixelCheck.nonBg}, 蓝调像素=${pixelCheck.bluish}`);
+    console.log(`[verify] 像素检查: 单位屏幕(${pixelCheck.sx.toFixed(0)}, ${pixelCheck.sy.toFixed(0)}) 非背景=${pixelCheck.nonBg} 蓝调=${pixelCheck.bluish}`);
     if (pixelCheck.bluish < 100) {
-      console.error('[verify] 单位区域蓝调像素过少，单位可能未正确绘制！');
+      console.error('[verify] 单位区域蓝调像素过少，单位可能未正确绘制/贴地！');
       result = 'errors';
     }
   } else {
     console.warn(`[verify] 像素检查跳过: ${pixelCheck?.error ?? 'unknown'}`);
   }
 
-  // ASCII 可视化：采样单位区域 40x16 个块，按颜色类别输出字符
-  const ascii = await page.evaluate(() => {
-    const canvas = document.getElementById('game-canvas');
-    const gl = canvas.getContext('webgl2') ?? canvas.getContext('webgl');
-    if (!gl) return 'no gl';
-    const w = canvas.width;
-    const h = canvas.height;
-    const st = window.__battleScene.debugState();
-    const cx = Math.round((st.unitPos.x * 28 + 456) * 1.4);
-    const cy = Math.round((st.unitPos.y * 28 + 280) * 1.4);
-    const cols = 44;
-    const rows = 20;
-    const rw = 220;
-    const rh = 260;
-    const x0 = cx - rw / 2;
-    const y0 = cy - rh / 2;
-    const px = new Uint8Array(rw * rh * 4);
-    gl.readPixels(Math.max(0, x0), Math.max(0, h - y0 - rh), rw, rh, gl.RGBA, gl.UNSIGNED_BYTE, px);
-    const cls = (r, g, b) => {
-      if (Math.abs(r - 18) + Math.abs(g - 36) + Math.abs(b - 24) < 60) return ' '; // 背景
-      if (g > r && g > b) return '.'; // 草地
-      if (b > r + 25 && b > 100) return '#'; // 蓝调(盔甲)
-      if (r > 200 && g > 190 && b > 190) return '+'; // 金属亮色
-      if (r > 150 && g > 110 && b < 90) return 'R'; // 红/褐(盔缨/木杆)
-      return 'o'; // 其他
-    };
-    let out = '';
-    for (let ry = 0; ry < rows; ry++) {
-      let line = '';
-      for (let rx = 0; rx < cols; rx++) {
-        const sx = Math.floor((rx / cols) * rw);
-        const sy = Math.floor((ry / rows) * rh);
-        const i = (sy * rw + sx) * 4;
-        line += cls(px[i], px[i + 1], px[i + 2]);
-      }
-      out += line + '\n';
-    }
-    return out;
+  // —— 面板统计 ——
+  const stats = await page.evaluate(() => {
+    const panel = document.getElementById('debug-panel');
+    if (!panel) return null;
+    return [...panel.querySelectorAll('.row')].map((r) =>
+      r.textContent ? r.textContent.trim().replace(/\s+/g, ' ') : '',
+    );
   });
-  console.log('[verify] 单位区域 ASCII 地图 (中心: 单位位置):');
-  console.log(ascii);
+  console.log('[verify] 面板统计:');
+  for (const row of stats ?? []) console.log('   ' + row);
 
   if (consoleErrors.length > 0) {
     result = 'errors';
@@ -193,7 +191,6 @@ try {
   console.log(`[verify] 截图已保存: ${outPng} (${fs.statSync(outPng).size} bytes)`);
 } finally {
   await browser.close();
-  // 清理可能残留的浏览器进程
   try {
     spawn('taskkill', ['/F', '/IM', 'chrome.exe', '/T'], { stdio: 'ignore' });
     spawn('taskkill', ['/F', '/IM', 'msedge.exe', '/T'], { stdio: 'ignore' });

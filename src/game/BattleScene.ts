@@ -1,39 +1,47 @@
 /**
  * 战斗场景组装（game/BattleScene.ts）—— 把 sim + anim + render 连接起来。
  *
- * 阶段 0 演示切片：一个长枪兵在草地上自动巡逻，
- * 由程序化骨骼动画驱动（待机/移动/转向/攻击/格挡/受击/死亡），
- * 命中帧触发"闪白 + 震屏"，死亡播放溶解；
- * 调试面板可实时调整 shader 参数与动画状态，验证固定时间步长与数据驱动。
+ * 阶段 1：程序化战场地图（草地/道路/营地/水塘/装饰）+ 带边界限制的相机
+ *         （滚轮缩放/拖拽/键盘平移）+ 单位贴地阴影 + 鼠标世界坐标。
+ * 阶段 0 能力保留：长枪兵自动巡逻 + 自动攻击命中帧闪白震屏 + 死亡溶解 + 调试面板。
  */
 import { ANIM_EVENTS } from '../anim/events';
 import { AnimationPlayer } from '../anim/dragonbones';
 import { AnimationStateMachine, type AnimStateMap } from '../anim/stateMachine';
 import { generateSpearmanAssets } from '../art/generate';
 import { Loop } from '../core/loop';
+import { generateBattlefieldMap, isWalkable } from '../data/map';
 import { SPEARMAN_ANIM_STATES, SPEARMAN_STATS } from '../data/spearman';
 import { ArmatureView } from '../render/armature/ArmatureView';
-import { createGrassBackground } from '../render/background';
 import { Camera } from '../render/camera';
 import { WORLD_SCALE } from '../render/constants';
 import { Layers } from '../render/layers';
+import { MapView } from '../render/map/MapView';
 import { PixiRenderer } from '../render/PixiRenderer';
+import { ShadowView } from '../render/ShadowView';
 import { Battle, type UnitController } from '../sim/battle';
 import { Unit } from '../sim/unit';
 import { DebugPanel } from '../ui/DebugPanel';
 import { lerp } from '../utils/math';
-import type { UnitAnimState } from '../types';
+import type { UnitAnimState, Vec2 } from '../types';
 import type { Scene } from './scenes';
 
-/** 巡逻范围（世界单位） */
-const PATROL_MIN = -6;
-const PATROL_MAX = 10;
+/** 巡逻范围（世界单位，沿主路） */
+const PATROL_MIN = 4;
+const PATROL_MAX = 24;
+const UNIT_Y = 18; // 主路 y 中心
 /** 自动攻击演示间隔（秒） */
 const AUTO_ATTACK_INTERVAL = 4.5;
 /** 死亡溶解时长（秒，与 death 动画一致） */
 const DEATH_DISSOLVE_TIME = 1.4;
 /** 受击闪白时长（秒） */
 const FLASH_TIME = 0.12;
+/** 相机初始缩放 */
+const CAM_ZOOM = 1.4;
+/** 相机边界边距（世界像素） */
+const CAM_MARGIN = 120;
+/** 键盘平移速度（屏幕像素/秒） */
+const PAN_SPEED = 700;
 
 export interface BattleSceneOptions {
   canvas: HTMLCanvasElement;
@@ -45,12 +53,14 @@ export class BattleScene implements Scene {
   private layers!: Layers;
   private camera!: Camera;
   private loop: Loop | null = null;
+  private map = generateBattlefieldMap();
 
   private unit!: Unit;
   private battle!: Battle;
   private player!: AnimationPlayer;
   private sm!: AnimationStateMachine;
   private view!: ArmatureView;
+  private shadow!: ShadowView;
   private panel!: DebugPanel;
 
   /** 一次性动作（attack/block/hit/turn/death）剩余时间 */
@@ -64,6 +74,9 @@ export class BattleScene implements Scene {
   private renderFps = 0;
   private stopped = false;
 
+  private mouseScreen: Vec2 = { x: 0, y: 0 };
+  private readonly keys = new Set<string>();
+
   constructor(private readonly opts: BattleSceneOptions) {}
 
   async start(): Promise<void> {
@@ -75,32 +88,43 @@ export class BattleScene implements Scene {
       height: window.innerHeight,
       background: 0x122418,
     });
-    // 相机：聚焦巡逻区域（世界单位 -6..10），单位居中的初始取景
-    this.camera = new Camera(1.4, { x: -456, y: -280 });
-    this.camera.setScaleRange(0.6, 3);
+
+    const focusPx: Vec2 = { x: 12 * WORLD_SCALE, y: UNIT_Y * WORLD_SCALE };
+    this.camera = new Camera(CAM_ZOOM, {
+      x: focusPx.x - this.renderer.width / 2 / CAM_ZOOM,
+      y: focusPx.y - this.renderer.height / 2 / CAM_ZOOM,
+    });
+    this.camera.setScaleRange(0.5, 3);
+    this.camera.setView(this.renderer.width, this.renderer.height);
+    // 世界像素空间的地图边界（阶段 1 验收：平移/缩放不越界）
+    this.camera.setBounds({ x: 0, y: 0, w: this.map.width * WORLD_SCALE, h: this.map.height * WORLD_SCALE }, CAM_MARGIN);
+
     this.layers = new Layers(this.renderer, this.renderer.root);
 
-    // 2. 背景（阶段 1 扩展为完整战场地图）
-    const bg = createGrassBackground(96 * WORLD_SCALE, 64 * WORLD_SCALE);
-    bg.position.set(-64 * WORLD_SCALE, -32 * WORLD_SCALE);
-    this.layers.addChildTo('background', bg);
+    // 2. 战场地图（静态，只绘制一次）
+    const mapView = new MapView(this.map);
+    this.layers.addChildTo('background', mapView.ground);
+    this.layers.addChildTo('background', mapView.decorations);
+    this.layers.addChildTo('background', mapView.border);
 
-    // 3. 程序化资产：矢量部件 → 图集 + 骨骼数据（阶段 0 验收点 5）
+    // 3. 程序化资产：矢量部件 → 图集 + 骨骼数据
     const assets = generateSpearmanAssets();
 
-    // 4. sim：单位 + 战斗世界（演示控制器：巡逻 + 自动攻击）
-    this.unit = new Unit('spearman', 0, SPEARMAN_STATS, { x: 0, y: 0 });
+    // 4. sim：单位（贴地：脚底在主路上）+ 战斗世界（演示控制器）
+    this.unit = new Unit('spearman', 0, SPEARMAN_STATS, { x: 6, y: UNIT_Y });
     this.battle = new Battle([this.unit], this.patrolController);
 
     // 5. anim：DragonBones 兼容播放器 + 数据驱动状态机
     this.player = new AnimationPlayer(assets.skeleton, 'spearman');
-    const map: AnimStateMap = {};
-    for (const c of SPEARMAN_ANIM_STATES) map[c.state] = c;
-    this.sm = new AnimationStateMachine(this.player, map, 'idle');
+    const smMap: AnimStateMap = {};
+    for (const c of SPEARMAN_ANIM_STATES) smMap[c.state] = c;
+    this.sm = new AnimationStateMachine(this.player, smMap, 'idle');
 
-    // 6. render：骨骼视图（slot 精灵 + 闪白/描边/溶解滤镜）
+    // 6. render：骨骼视图（slot 精灵 + 三滤镜）+ 贴地阴影
     this.view = new ArmatureView({ atlas: assets.atlas, rig: assets.rig });
     this.layers.addChildTo('unit', this.view.container);
+    this.shadow = new ShadowView();
+    this.layers.addChildTo('shadow', this.shadow.container);
 
     // 7. 调试面板
     this.panel = new DebugPanel(this.opts.panelEl, {
@@ -130,7 +154,7 @@ export class BattleScene implements Scene {
     });
     this.loop.start();
 
-    // 9. 输入：滚轮缩放 + 拖拽平移
+    // 9. 输入：滚轮缩放 + 拖拽/键盘平移 + 鼠标追踪 + 窗口缩放
     this.bindInput();
   }
 
@@ -148,6 +172,7 @@ export class BattleScene implements Scene {
     animState: string;
     dirX: number;
     renderFps: number;
+    camera: { scale: number; offset: { x: number; y: number }; view: { w: number; h: number } };
     view: {
       pos: { x: number; y: number };
       children: number;
@@ -165,6 +190,11 @@ export class BattleScene implements Scene {
       animState: this.sm.current,
       dirX: this.unit.dirX,
       renderFps: this.renderFps,
+      camera: {
+        scale: this.camera.scale,
+        offset: { ...this.camera.offset },
+        view: { w: this.renderer.width, h: this.renderer.height },
+      },
       view: {
         pos: { x: v.container.position.x, y: v.container.position.y },
         children: v.container.children.length,
@@ -193,7 +223,7 @@ export class BattleScene implements Scene {
       this.playOneShot('attack');
       return;
     }
-    // 巡逻：沿 x 轴往返
+    // 巡逻：沿主路 x 轴往返
     unit.prevPos = { ...unit.pos };
     unit.pos.x += unit.dirX * unit.stats.moveSpeed * dt;
     if (unit.pos.x >= PATROL_MAX) {
@@ -231,6 +261,7 @@ export class BattleScene implements Scene {
       if (this.dissolveT >= 1) {
         this.dissolving = false;
         this.view.visible = false;
+        this.shadow.visible = false;
       }
     }
 
@@ -247,14 +278,19 @@ export class BattleScene implements Scene {
     this.lastFrameMs = now;
     if (frameDt > 0) this.renderFps = 1000 / frameDt;
 
+    // 键盘平移（WASD/方向键）
+    this.applyKeyboardPan(frameDt / 1000);
+
     // 位置插值（固定步长 prev/curr + alpha）
     const px = lerp(this.unit.prevPos.x, this.unit.pos.x, alpha) * WORLD_SCALE;
     const py = lerp(this.unit.prevPos.y, this.unit.pos.y, alpha) * WORLD_SCALE;
     this.view.setPosition(px, py);
     this.view.setFacing(this.unit.dirX);
     this.view.applyPose(this.player.armatureState.slots);
+    // 贴地阴影（脚底微偏下）
+    this.shadow.setPosition(px, py + 4);
 
-    // 相机：screen = (world - offset) × scale（含震屏）
+    // 相机：screen = (worldPx - offset) × scale（含震屏）
     const shx = this.shake > 0 ? (Math.random() - 0.5) * this.shake * 5 : 0;
     const shy = this.shake > 0 ? (Math.random() - 0.5) * this.shake * 5 : 0;
     this.renderer.setTransform(this.renderer.root, {
@@ -267,6 +303,7 @@ export class BattleScene implements Scene {
     this.renderer.render();
 
     // 面板统计
+    const mouseWorld = this.camera.screenToWorld(this.mouseScreen);
     this.panel.updateStats({
       renderFps: this.renderFps,
       simStepsPerSec: this.loop?.stepsPerSec ?? 0,
@@ -275,7 +312,21 @@ export class BattleScene implements Scene {
       animState: this.sm.current,
       dirX: this.unit.dirX,
       camScale: this.camera.scale,
+      mouseWorld: { x: mouseWorld.x / WORLD_SCALE, y: mouseWorld.y / WORLD_SCALE },
+      unitWalkable: isWalkable(this.map, this.unit.pos),
     });
+  }
+
+  private applyKeyboardPan(dtReal: number): void {
+    let dx = 0;
+    let dy = 0;
+    if (this.keys.has('ArrowLeft') || this.keys.has('KeyA')) dx -= 1;
+    if (this.keys.has('ArrowRight') || this.keys.has('KeyD')) dx += 1;
+    if (this.keys.has('ArrowUp') || this.keys.has('KeyW')) dy -= 1;
+    if (this.keys.has('ArrowDown') || this.keys.has('KeyS')) dy += 1;
+    if (dx !== 0 || dy !== 0) {
+      this.camera.pan(dx * PAN_SPEED * dtReal, dy * PAN_SPEED * dtReal);
+    }
   }
 
   // —— 状态与表现控制 ——
@@ -328,9 +379,10 @@ export class BattleScene implements Scene {
   }
 
   private resetUnit(): void {
-    this.unit = new Unit('spearman', 0, SPEARMAN_STATS, { x: 0, y: 0 });
+    this.unit = new Unit('spearman', 0, SPEARMAN_STATS, { x: 6, y: UNIT_Y });
     this.battle = new Battle([this.unit], this.patrolController);
     this.view.visible = true;
+    this.shadow.visible = true;
     this.view.dissolve.progress = 0;
     this.view.flash.amount = 0;
     this.dissolving = false;
@@ -378,6 +430,8 @@ export class BattleScene implements Scene {
       canvas.setPointerCapture(e.pointerId);
     });
     canvas.addEventListener('pointermove', (e) => {
+      const rect = canvas.getBoundingClientRect();
+      this.mouseScreen = { x: e.clientX - rect.left, y: e.clientY - rect.top };
       if (!dragging) return;
       this.camera.pan(e.clientX - lastX, e.clientY - lastY);
       lastX = e.clientX;
@@ -389,8 +443,13 @@ export class BattleScene implements Scene {
     canvas.addEventListener('pointerup', endDrag);
     canvas.addEventListener('pointercancel', endDrag);
 
+    window.addEventListener('keydown', (e) => this.keys.add(e.code));
+    window.addEventListener('keyup', (e) => this.keys.delete(e.code));
+    window.addEventListener('blur', () => this.keys.clear());
+
     window.addEventListener('resize', () => {
       this.renderer.resize(window.innerWidth, window.innerHeight);
+      this.camera.setView(this.renderer.width, this.renderer.height);
     });
   }
 }
