@@ -130,6 +130,23 @@ try {
     }
   }
 
+  // —— 键盘平移 E2E：按右箭头 → 镜头右移（offset.x 增大，看右侧内容） ——
+  const camKeyBefore = await probe(page);
+  await page.keyboard.down('ArrowRight');
+  await new Promise((r) => setTimeout(r, 500));
+  await page.keyboard.up('ArrowRight');
+  const camKeyAfter = await probe(page);
+  if (camKeyBefore && camKeyAfter) {
+    const b = camKeyBefore.camera;
+    const a = camKeyAfter.camera;
+    if (a.offset.x <= b.offset.x + 0.01 && a.offset.x > -120 + 0.5) {
+      console.error(`[verify] 键盘右箭头方向错误（offset.x ${b.offset.x.toFixed(1)} → ${a.offset.x.toFixed(1)}，镜头应右移）！`);
+      result = 'errors';
+    } else {
+      console.log(`[verify] 键盘平移: offset.x ${b.offset.x.toFixed(1)} → ${a.offset.x.toFixed(1)} (右箭头=镜头右移 ✓)`);
+    }
+  }
+
   await page.screenshot({ path: outPng });
 
   // —— 像素检查：单位区域存在盔甲蓝调像素（缩放平移后单位仍正确绘制/贴地） ——

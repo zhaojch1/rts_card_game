@@ -325,7 +325,9 @@ export class BattleScene implements Scene {
     if (this.keys.has('ArrowUp') || this.keys.has('KeyW')) dy -= 1;
     if (this.keys.has('ArrowDown') || this.keys.has('KeyS')) dy += 1;
     if (dx !== 0 || dy !== 0) {
-      this.camera.pan(dx * PAN_SPEED * dtReal, dy * PAN_SPEED * dtReal);
+      // 键盘语义 = "镜头移动方向"（按右箭头 → 镜头右移 → 看到右侧内容 → 内容左移）。
+      // pan(dx) 实现的是"内容右移 dx"（拖拽语义），因此这里取反。
+      this.camera.pan(-dx * PAN_SPEED * dtReal, -dy * PAN_SPEED * dtReal);
     }
   }
 

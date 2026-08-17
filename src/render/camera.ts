@@ -85,6 +85,10 @@ export class Camera implements ICamera {
     return { x: p.x / this._scale + this._offset.x, y: p.y / this._scale + this._offset.y };
   }
 
+  /**
+   * 按屏幕像素平移（**内容移动**语义：dx>0 表示内容右移，即"拖拽抓取"操作）。
+   * 键盘等"镜头移动"操作（按右箭头=看右侧内容）需取反：camera.pan(-dx, -dy)。
+   */
   pan(dx: number, dy: number): void {
     this._offset.x -= dx / this._scale;
     this._offset.y -= dy / this._scale;
