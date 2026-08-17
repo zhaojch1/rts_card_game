@@ -198,6 +198,44 @@ try {
   console.log('[verify] 面板统计:');
   for (const row of stats ?? []) console.log('   ' + row);
 
+  // —— 7 动作播放验证（需求 9.1：待机/移动/转向/攻击/格挡/受击/死亡） ——
+  const states = ['idle', 'walk', 'attack', 'block', 'hit', 'turn', 'death'];
+  let animOk = true;
+  for (const state of states) {
+    await page.evaluate((s) => {
+      const scene = window.__battleScene;
+      scene.debugReset();
+      scene.debugPlay(s);
+    }, state);
+    await new Promise((r) => setTimeout(r, 150));
+    const st = await probe(page);
+    if (st && st.animState === state) {
+      console.log(`[verify] 动作 ${state} ✓`);
+    } else {
+      console.error(`[verify] 动作 ${state} 未进入（实际 ${st?.animState ?? '无场景'}）`);
+      animOk = false;
+    }
+  }
+  if (!animOk) result = 'errors';
+  await page.evaluate(() => window.__battleScene.debugReset());
+
+  // —— 攻击命中触发打击感特效（需求 9.2：命中帧后飘字存活） ——
+  await page.evaluate(() => {
+    window.__battleScene.debugReset();
+    window.__battleScene.debugPlay('attack');
+  });
+  await new Promise((r) => setTimeout(r, 560)); // 命中帧 0.45s + 0.11s（飘字 0.85s 内仍存活）
+  const fxProbe = await probe(page);
+  if (fxProbe) {
+    if (fxProbe.fxActive >= 1) {
+      console.log(`[verify] 命中特效: 活动特效数=${fxProbe.fxActive} (飘字/火花已触发 ✓)`);
+    } else {
+      console.error('[verify] 命中帧未触发特效（fxActive=0）！');
+      result = 'errors';
+    }
+  }
+  await page.evaluate(() => window.__battleScene.debugReset());
+
   if (consoleErrors.length > 0) {
     result = 'errors';
     console.error('[verify] console 错误:');

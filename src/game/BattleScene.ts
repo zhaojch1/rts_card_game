@@ -15,6 +15,7 @@ import { SPEARMAN_ANIM_STATES, SPEARMAN_STATS } from '../data/spearman';
 import { ArmatureView } from '../render/armature/ArmatureView';
 import { Camera } from '../render/camera';
 import { WORLD_SCALE } from '../render/constants';
+import { EffectsManager } from '../render/effects/EffectsManager';
 import { Layers } from '../render/layers';
 import { MapView } from '../render/map/MapView';
 import { PixiRenderer } from '../render/PixiRenderer';
@@ -25,6 +26,7 @@ import { DebugPanel } from '../ui/DebugPanel';
 import { lerp } from '../utils/math';
 import type { UnitAnimState, Vec2 } from '../types';
 import type { Scene } from './scenes';
+import type { Container } from 'pixi.js';
 
 /** 巡逻范围（世界单位，沿主路） */
 const PATROL_MIN = 4;
@@ -62,6 +64,7 @@ export class BattleScene implements Scene {
   private view!: ArmatureView;
   private shadow!: ShadowView;
   private panel!: DebugPanel;
+  private effects!: EffectsManager;
 
   /** 一次性动作（attack/block/hit/turn/death）剩余时间 */
   private oneShotRemain = 0;
@@ -73,6 +76,16 @@ export class BattleScene implements Scene {
   private lastFrameMs = 0;
   private renderFps = 0;
   private stopped = false;
+  /** 手动保持模式：面板点了 idle/walk 后暂停自动巡逻，便于观察动作 */
+  private manualHold = false;
+
+  // —— 打击感参数（需求 9.2，调试面板可调） ——
+  /** 命中顿帧剩余时间 */
+  private hitstopTimer = 0;
+  private hitstopEnabled = true;
+  private hitstopDuration = 0.09;
+  private shakeAmount = 1;
+  private floatTextEnabled = true;
 
   private mouseScreen: Vec2 = { x: 0, y: 0 };
   private readonly keys = new Set<string>();
@@ -120,11 +133,12 @@ export class BattleScene implements Scene {
     for (const c of SPEARMAN_ANIM_STATES) smMap[c.state] = c;
     this.sm = new AnimationStateMachine(this.player, smMap, 'idle');
 
-    // 6. render：骨骼视图（slot 精灵 + 三滤镜）+ 贴地阴影
+    // 6. render：骨骼视图（slot 精灵 + 三滤镜）+ 贴地阴影 + 打击感特效
     this.view = new ArmatureView({ atlas: assets.atlas, rig: assets.rig });
     this.layers.addChildTo('unit', this.view.container);
     this.shadow = new ShadowView();
     this.layers.addChildTo('shadow', this.shadow.container);
+    this.effects = new EffectsManager(this.layers.get('effect') as Container);
 
     // 7. 调试面板
     this.panel = new DebugPanel(this.opts.panelEl, {
@@ -144,6 +158,18 @@ export class BattleScene implements Scene {
       onZoomIn: () => this.zoomCamera(1.25),
       onZoomOut: () => this.zoomCamera(0.8),
       onReset: () => this.resetUnit(),
+      onHitstopEnabled: (v) => {
+        this.hitstopEnabled = v;
+      },
+      onHitstopDuration: (v) => {
+        this.hitstopDuration = v;
+      },
+      onShakeAmount: (v) => {
+        this.shakeAmount = v;
+      },
+      onFloatText: (v) => {
+        this.floatTextEnabled = v;
+      },
     });
 
     // 8. 主循环：固定时间步长（1/60s）+ 渲染插值
@@ -163,6 +189,16 @@ export class BattleScene implements Scene {
     this.loop?.stop();
   }
 
+  /** 调试：播放指定动画状态（验证脚本/开发者工具用） */
+  debugPlay(state: UnitAnimState): void {
+    this.playState(state);
+  }
+
+  /** 调试：重置单位（验证脚本/开发者工具用） */
+  debugReset(): void {
+    this.resetUnit();
+  }
+
   /** 调试探针：供浏览器验证脚本/开发者工具读取运行时状态 */
   debugState(): {
     simTime: number;
@@ -173,6 +209,7 @@ export class BattleScene implements Scene {
     dirX: number;
     renderFps: number;
     camera: { scale: number; offset: { x: number; y: number }; view: { w: number; h: number } };
+    fxActive: number;
     view: {
       pos: { x: number; y: number };
       children: number;
@@ -195,6 +232,7 @@ export class BattleScene implements Scene {
         offset: { ...this.camera.offset },
         view: { w: this.renderer.width, h: this.renderer.height },
       },
+      fxActive: this.effects.activeCount,
       view: {
         pos: { x: v.container.position.x, y: v.container.position.y },
         children: v.container.children.length,
@@ -210,6 +248,8 @@ export class BattleScene implements Scene {
 
   private readonly patrolController: UnitController = (unit, _battle, dt) => {
     if (!unit.alive || this.dissolving) return;
+    // 手动保持模式：暂停自动行为，保持当前动作便于观察
+    if (this.manualHold) return;
     // 一次性动作期间不移动
     if (this.oneShotRemain > 0) {
       this.oneShotRemain -= dt;
@@ -240,13 +280,23 @@ export class BattleScene implements Scene {
 
   private fixedUpdate(dt: number): void {
     if (this.stopped) return;
-    this.battle.update(dt);
-    this.player.update(dt);
 
-    // 动画事件 → 逻辑/表现联动（需求 6.3：命中帧驱动伤害结算，画面数值同步）
-    for (const ev of this.player.drainEvents()) {
-      if (ev === ANIM_EVENTS.HIT_FRAME) this.onHitFrame();
+    // 命中顿帧（Hitstop，需求 9.2.2）：命中瞬间逻辑与动画暂停数帧，
+    // 制造"打中了"的重量感；表现层（闪白/震屏/特效）继续推进。
+    if (this.hitstopTimer > 0) {
+      this.hitstopTimer -= dt;
+    } else {
+      this.battle.update(dt);
+      this.player.update(dt);
+
+      // 动画事件 → 逻辑/表现联动（需求 6.3：命中帧驱动伤害结算，画面数值同步）
+      for (const ev of this.player.drainEvents()) {
+        if (ev === ANIM_EVENTS.HIT_FRAME) this.onHitFrame();
+        else if (ev === ANIM_EVENTS.BLOCK_FRAME) this.onBlockFrame();
+      }
     }
+
+    this.effects.update(dt);
 
     // 受击闪白衰减
     if (this.flashTimer > 0) {
@@ -285,7 +335,11 @@ export class BattleScene implements Scene {
     const px = lerp(this.unit.prevPos.x, this.unit.pos.x, alpha) * WORLD_SCALE;
     const py = lerp(this.unit.prevPos.y, this.unit.pos.y, alpha) * WORLD_SCALE;
     this.view.setPosition(px, py);
-    this.view.setFacing(this.unit.dirX);
+    // 朝向平滑插值（需求 9.1 turn：改变方向不瞬移；配合 turn 动作表现转身）
+    const frameDtSec = frameDt / 1000;
+    const curDir = this.view.container.scale.x;
+    const nextDir = lerp(curDir, this.unit.dirX, Math.min(1, frameDtSec * 12));
+    this.view.container.scale.x = nextDir;
     this.view.applyPose(this.player.armatureState.slots);
     // 贴地阴影（脚底微偏下）
     this.shadow.setPosition(px, py + 4);
@@ -365,8 +419,9 @@ export class BattleScene implements Scene {
       this.playOneShot(state);
       return;
     }
-    // idle / walk：直接切换并解除一次性锁定
+    // idle / walk：直接切换、解除一次性锁定，并进入手动保持（便于观察动作）
     this.oneShotRemain = 0;
+    this.manualHold = true;
     this.sm.setState(state);
   }
 
@@ -383,6 +438,7 @@ export class BattleScene implements Scene {
   private resetUnit(): void {
     this.unit = new Unit('spearman', 0, SPEARMAN_STATS, { x: 6, y: UNIT_Y });
     this.battle = new Battle([this.unit], this.patrolController);
+    this.manualHold = false;
     this.view.visible = true;
     this.shadow.visible = true;
     this.view.dissolve.progress = 0;
@@ -396,9 +452,34 @@ export class BattleScene implements Scene {
   }
 
   private onHitFrame(): void {
+    // 打击感联动（需求 9.2）：闪白 + 震屏 + 命中顿帧 + 伤害飘字 + 火花
     this.flashTimer = FLASH_TIME;
     this.view.flash.amount = 1;
-    this.shake = 1;
+    this.shake = this.shakeAmount;
+    if (this.hitstopEnabled) this.hitstopTimer = this.hitstopDuration;
+
+    const tip = this.spearTipPx();
+    this.effects.spawnImpact(tip.x, tip.y, 0xffd76a);
+    if (this.floatTextEnabled) {
+      // 演示伤害（阶段 3 起由真实结算提供）：攻击 15 - 防御 5 ± 随机
+      const dmg = 10 + Math.floor(Math.random() * 9);
+      this.effects.spawnFloatingText(`-${dmg}`, tip.x, tip.y - 10, { color: '#ffd76a' });
+    }
+  }
+
+  /** 格挡命中反馈（需求 9.2.5）：区别于受击——蓝火花 + 轻震屏，无伤害飘字 */
+  private onBlockFrame(): void {
+    const tip = this.spearTipPx();
+    this.effects.spawnImpact(tip.x, tip.y, 0x9fd8ff, 7);
+    this.shake = Math.max(this.shake, 0.4 * this.shakeAmount);
+  }
+
+  /** 枪尖世界像素位置（火花/飘字锚点；近似：单位前方 55px、胸口高度） */
+  private spearTipPx(): { x: number; y: number } {
+    return {
+      x: this.unit.pos.x * WORLD_SCALE + this.unit.dirX * 55,
+      y: this.unit.pos.y * WORLD_SCALE - 30,
+    };
   }
 
   private zoomCamera(factor: number): void {

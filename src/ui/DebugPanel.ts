@@ -28,6 +28,14 @@ export interface DebugPanelHooks {
   onZoomIn(): void;
   onZoomOut(): void;
   onReset(): void;
+  /** 命中顿帧开关 */
+  onHitstopEnabled(v: boolean): void;
+  /** 命中顿帧时长（秒） */
+  onHitstopDuration(v: number): void;
+  /** 震屏幅度 */
+  onShakeAmount(v: number): void;
+  /** 伤害飘字开关 */
+  onFloatText(v: boolean): void;
 }
 
 const STATE_LABELS: Record<UnitAnimState, string> = {
@@ -119,6 +127,20 @@ export class DebugPanel {
     fx.appendChild(cbRow);
     el.appendChild(fx);
 
+    // —— 打击感（需求 9.2） ——
+    const feel = document.createElement('div');
+    feel.className = 'group';
+    const feelTitle = document.createElement('div');
+    feelTitle.className = 'title';
+    feelTitle.textContent = '打击感';
+    feel.appendChild(feelTitle);
+
+    feel.appendChild(this.slider('命中顿帧时长 (s)', 0.02, 0.2, 0.09, 0.01, (v) => hooks.onHitstopDuration(v)));
+    feel.appendChild(this.slider('震屏幅度', 0, 3, 1, 0.1, (v) => hooks.onShakeAmount(v)));
+    feel.appendChild(this.checkbox('命中顿帧', true, (v) => hooks.onHitstopEnabled(v)));
+    feel.appendChild(this.checkbox('伤害飘字', true, (v) => hooks.onFloatText(v)));
+    el.appendChild(feel);
+
     // —— 动画状态 ——
     const anim = document.createElement('div');
     anim.className = 'group';
@@ -169,6 +191,19 @@ export class DebugPanel {
       '固定时间步长 1/60s：模拟步数/秒 恒为 60，与刷新率无关；渲染每帧插值。' +
       '单位沿主路巡逻，每约 4.5s 自动攻击（命中帧闪白+震屏）。';
     el.appendChild(note);
+  }
+
+  private checkbox(label: string, checked: boolean, onChange: (v: boolean) => void): HTMLElement {
+    const row = document.createElement('label');
+    const span = document.createElement('span');
+    span.textContent = label;
+    const input = document.createElement('input');
+    input.type = 'checkbox';
+    input.checked = checked;
+    input.addEventListener('change', () => onChange(input.checked));
+    row.appendChild(span);
+    row.appendChild(input);
+    return row;
   }
 
   private slider(
