@@ -6,8 +6,7 @@
  * 附带三个可调 shader 滤镜：受击闪白 / 描边 / 死亡溶解（需求 5.3）。
  */
 import { Container, Sprite, Texture } from 'pixi.js';
-import type { SlotPose } from '../../anim/dragonbones';
-import type { RigDef } from '../../art/rig';
+import type { RigDef, SlotPose } from '../../anim/dragonbones';
 import { buildSlotSprites, createAtlasTextures } from '../batch';
 import { DissolveFilter, FlashFilter, OutlineFilter } from '../shaders';
 import type { BakedAtlas } from '../../art/bake';

@@ -4,10 +4,20 @@
 import { describe, expect, it } from 'vitest';
 import { Battle } from '../src/sim/battle';
 import { Unit } from '../src/sim/unit';
-import { SPEARMAN_STATS } from '../src/data/spearman';
+import type { UnitStats } from '../src/types';
+
+const TEST_STATS: UnitStats = {
+  attack: 15,
+  health: 100,
+  defense: 5,
+  attackSpeed: 1,
+  moveSpeed: 1.2,
+  attackRange: 1.8,
+  critChance: 0.1,
+};
 
 function makeUnit(team: 0 | 1, x: number): Unit {
-  return new Unit('spearman', team, { ...SPEARMAN_STATS }, { x, y: 0 });
+  return new Unit('test', team, { ...TEST_STATS }, { x, y: 0 });
 }
 
 describe('Battle', () => {

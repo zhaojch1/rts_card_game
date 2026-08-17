@@ -7,7 +7,7 @@
 import { describe, expect, it } from 'vitest';
 import { AnimationPlayer } from '../src/anim/dragonbones';
 import type { SkeletonData } from '../src/anim/dragonbones';
-import { skeletonToDragonBonesJson } from '../src/art/generate';
+import { skeletonToDragonBonesJson } from '../src/anim/exportJson';
 
 /** 最小骨架：root → pelvis → torso → head；root 带平移动画，head 带旋转动画 */
 const MINI_SKELETON: SkeletonData = {

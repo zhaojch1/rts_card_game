@@ -2,8 +2,8 @@
  * 浏览器验证脚本（scripts/verify-browser.mjs）
  *
  * 用本机 Chrome/Edge（headless + SwiftShader）加载开发服务器页面，
- * 采集 console 错误、验证固定时间步长/单位移动/像素渲染，
- * 并 E2E 验证相机交互（滚轮缩放、拖拽平移、边界限制）。
+ * 验证框架底座：固定时间步长推进、测试对象移动、相机交互（滚轮/拖拽/键盘）、
+ * 像素渲染（shader 测试对象可见）、无 console 错误。
  *
  * 用法：node scripts/verify-browser.mjs [url] [out.png]
  * 依赖：dev server 已在 5173 端口运行；本机装有 Chrome 或 Edge。
@@ -14,7 +14,7 @@ import path from 'node:path';
 import puppeteer from 'puppeteer-core';
 
 const url = process.argv[2] ?? 'http://localhost:5173/';
-const outPng = process.argv[3] ?? path.resolve('stage1_check.png');
+const outPng = process.argv[3] ?? path.resolve('verify_check.png');
 
 const candidates = [
   process.env.CHROME_PATH,
@@ -39,13 +39,15 @@ const browser = await puppeteer.launch({
 });
 
 const probe = (page) =>
-  page.evaluate(() => (window.__battleScene ? window.__battleScene.debugState() : null));
-
-/** 世界单位 → 屏幕坐标（与场景相机公式一致） */
-const screenOf = (st, wx, wy) => ({
-  x: (wx * 28 - st.camera.offset.x) * st.camera.scale,
-  y: (wy * 28 - st.camera.offset.y) * st.camera.scale,
-});
+  page.evaluate(() => {
+    const s = window.__battleScene;
+    if (!s) return null;
+    try {
+      return s.debugState();
+    } catch {
+      return null; // 场景异步启动未完成
+    }
+  });
 
 try {
   const page = await browser.newPage();
@@ -63,37 +65,82 @@ try {
 
   // 注：vite HMR 的 websocket 使 networkidle 永不满足，用 load 即可
   await page.goto(url, { waitUntil: 'load', timeout: 20000 });
-  await new Promise((r) => setTimeout(r, 2500));
+  // 等待页面稳定（HMR 重载可能重置模拟）且场景就绪、至少一个完整统计窗口（>1s 模拟）
+  for (let i = 0; i < 30; i++) {
+    await new Promise((r) => setTimeout(r, 500));
+    const st = await probe(page);
+    if (st && st.camera && st.simTime > 3) break;
+  }
 
-  // —— 固定时间步长 + 单位移动 ——
+  // —— 像素检查：测试对象区域存在蓝色调像素（先于相机操作，保证对象在视野内） ——
+  const pixelCheck = await page.evaluate(() => {
+    const canvas = document.getElementById('game-canvas');
+    const gl = canvas.getContext('webgl2') ?? canvas.getContext('webgl');
+    if (!gl) return { error: 'no gl' };
+    const st = window.__battleScene?.debugState();
+    if (!st?.camera) return { error: 'scene not ready' };
+    const sx = (st.objPos.x * 28 - st.camera.offset.x) * st.camera.scale;
+    const sy = (st.objPos.y * 28 - st.camera.offset.y) * st.camera.scale;
+    const rx = 60;
+    const ry = 60;
+    const x0 = Math.max(0, Math.round(sx - rx));
+    const y0 = Math.max(0, Math.round(sy - ry));
+    const rw = Math.min(canvas.width, Math.round(sx + rx)) - x0;
+    const rh = Math.min(canvas.height, Math.round(sy + ry)) - y0;
+    if (rw <= 0 || rh <= 0) return { error: 'region out of bounds', sx, sy };
+    const px = new Uint8Array(rw * rh * 4);
+    gl.readPixels(x0, canvas.height - y0 - rh, rw, rh, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    let bluish = 0;
+    for (let i = 0; i < px.length; i += 4) {
+      const r = px[i];
+      const g = px[i + 1];
+      const b = px[i + 2];
+      if (b > r + 30 && b > 100) bluish++;
+    }
+    return { sx, sy, bluish };
+  });
+  if (pixelCheck && !pixelCheck.error) {
+    console.log(`[verify] 像素检查: 对象屏幕(${pixelCheck.sx.toFixed(0)}, ${pixelCheck.sy.toFixed(0)}) 蓝调=${pixelCheck.bluish}`);
+    if (pixelCheck.bluish < 100) {
+      console.error('[verify] 对象区域蓝色像素过少，测试对象可能未绘制！');
+      result = 'errors';
+    }
+  } else {
+    console.warn(`[verify] 像素检查跳过: ${pixelCheck?.error ?? 'unknown'}`);
+  }
+
+  // —— 固定时间步长 + 对象移动 ——
   const p1 = await probe(page);
   await new Promise((r) => setTimeout(r, 1500));
   const p2 = await probe(page);
   if (p1 && p2) {
-    const moved = Math.abs(p2.unitPos.x - p1.unitPos.x) > 0.01;
+    const simDt = p2.simTime - p1.simTime;
+    const moved = Math.abs(p2.objPos.x - p1.objPos.x);
+    // 固定步长正确性判据：对象位移必须等于 模拟时间增量 × 速度(1.2)
+    // （SwiftShader 慢渲染下帧间隔可能超过 dt 钳制阈值导致模拟推进变慢，
+    //   但"位移 = simDt × 速度"在任何帧率下都必须成立，这才是固定步长的本质）
+    const expected = simDt * 1.2;
+    const drift = Math.abs(moved - expected);
     console.log(
       `[verify] 模拟: simTime ${p1.simTime.toFixed(2)}s → ${p2.simTime.toFixed(2)}s, ` +
-        `位置 (${p1.unitPos.x.toFixed(2)}, ${p1.unitPos.y.toFixed(2)}) → (${p2.unitPos.x.toFixed(2)}, ${p2.unitPos.y.toFixed(2)}), ` +
-        `步数/秒=${p2.stepsPerSec}, 动画=${p2.animState}`,
+        `位移 ${moved.toFixed(3)} / 期望(simDt×1.2) ${expected.toFixed(3)}, 漂移 ${drift.toFixed(4)}`,
     );
-    if (p2.simTime <= p1.simTime) {
+    if (simDt <= 0) {
       console.error('[verify] 模拟时间未推进！');
       result = 'errors';
     }
-    if (!moved) {
-      console.error('[verify] 单位未移动！');
+    if (drift > 0.02) {
+      console.error('[verify] 对象位移与模拟时间不一致（固定步长失效？）！');
       result = 'errors';
     }
   }
 
   // —— 相机交互 E2E ——
   const camBefore = p2?.camera;
-  // 滚轮缩放（以屏幕中心为锚）
   await page.mouse.move(640, 360);
   await page.mouse.wheel({ deltaY: -240 }); // 放大
   await new Promise((r) => setTimeout(r, 400));
   const camZoomed = await probe(page);
-  // 拖拽平移（向右拖 200px）
   await page.mouse.move(640, 360);
   await page.mouse.down();
   await page.mouse.move(840, 360, { steps: 5 });
@@ -104,20 +151,15 @@ try {
   if (camBefore && camZoomed && camPanned) {
     const z = camZoomed.camera;
     const pn = camPanned.camera;
-    console.log(
-      `[verify] 相机: scale ${camBefore.scale.toFixed(2)} → ${z.scale.toFixed(2)} (滚轮), ` +
-        `offset (${pn.offset.x.toFixed(0)}, ${pn.offset.y.toFixed(0)})`,
-    );
+    console.log(`[verify] 相机: scale ${camBefore.scale.toFixed(2)} → ${z.scale.toFixed(2)} (滚轮), offset (${pn.offset.x.toFixed(0)}, ${pn.offset.y.toFixed(0)})`);
     if (z.scale <= camBefore.scale) {
       console.error('[verify] 滚轮放大未生效！');
       result = 'errors';
     }
-    // 拖拽向右 → pan(+dx) → offset.x 减小（若已触底则不变）
     if (pn.offset.x > z.offset.x + 0.01) {
-      console.error(`[verify] 拖拽平移方向错误（offset.x ${z.offset.x.toFixed(1)} → ${pn.offset.x.toFixed(1)}，应减小）！`);
+      console.error('[verify] 拖拽平移方向错误！');
       result = 'errors';
     }
-    // 边界限制：offset 必须在地图范围内（地图 1680×1064 px，边距 120）
     const visW = 1280 / pn.scale;
     const visH = 720 / pn.scale;
     const minX = -120;
@@ -125,12 +167,12 @@ try {
     const minY = -120;
     const maxY = 1064 - visH + 120;
     if (pn.offset.x < minX - 0.5 || pn.offset.x > maxX + 0.5 || pn.offset.y < minY - 0.5 || pn.offset.y > maxY + 0.5) {
-      console.error(`[verify] 相机偏移越界! offset=(${pn.offset.x.toFixed(1)}, ${pn.offset.y.toFixed(1)}), 范围 x[${minX.toFixed(0)},${maxX.toFixed(0)}] y[${minY.toFixed(0)},${maxY.toFixed(0)}]`);
+      console.error('[verify] 相机偏移越界！');
       result = 'errors';
     }
   }
 
-  // —— 键盘平移 E2E：按右箭头 → 镜头右移（offset.x 增大，看右侧内容） ——
+  // —— 键盘平移 E2E：右箭头 → 镜头右移（offset.x 增大） ——
   const camKeyBefore = await probe(page);
   await page.keyboard.down('ArrowRight');
   await new Promise((r) => setTimeout(r, 500));
@@ -140,7 +182,7 @@ try {
     const b = camKeyBefore.camera;
     const a = camKeyAfter.camera;
     if (a.offset.x <= b.offset.x + 0.01 && a.offset.x > -120 + 0.5) {
-      console.error(`[verify] 键盘右箭头方向错误（offset.x ${b.offset.x.toFixed(1)} → ${a.offset.x.toFixed(1)}，镜头应右移）！`);
+      console.error('[verify] 键盘右箭头方向错误！');
       result = 'errors';
     } else {
       console.log(`[verify] 键盘平移: offset.x ${b.offset.x.toFixed(1)} → ${a.offset.x.toFixed(1)} (右箭头=镜头右移 ✓)`);
@@ -148,44 +190,6 @@ try {
   }
 
   await page.screenshot({ path: outPng });
-
-  // —— 像素检查：单位区域存在盔甲蓝调像素（缩放平移后单位仍正确绘制/贴地） ——
-  const pixelCheck = await page.evaluate(() => {
-    const canvas = document.getElementById('game-canvas');
-    const gl = canvas.getContext('webgl2') ?? canvas.getContext('webgl');
-    if (!gl) return { error: 'no gl' };
-    const st = window.__battleScene.debugState();
-    const sx = (st.unitPos.x * 28 - st.camera.offset.x) * st.camera.scale;
-    const sy = (st.unitPos.y * 28 - st.camera.offset.y) * st.camera.scale;
-    const rx = 120;
-    const ry = 140;
-    const x0 = Math.max(0, Math.round(sx - rx));
-    const y0 = Math.max(0, Math.round(sy - ry));
-    const rw = Math.min(canvas.width, Math.round(sx + rx)) - x0;
-    const rh = Math.min(canvas.height, Math.round(sy + ry)) - y0;
-    if (rw <= 0 || rh <= 0) return { error: 'region out of bounds', sx, sy };
-    const px = new Uint8Array(rw * rh * 4);
-    gl.readPixels(x0, canvas.height - y0 - rh, rw, rh, gl.RGBA, gl.UNSIGNED_BYTE, px);
-    let bluish = 0;
-    let nonBg = 0;
-    for (let i = 0; i < px.length; i += 4) {
-      const r = px[i];
-      const g = px[i + 1];
-      const b = px[i + 2];
-      if (Math.abs(r - 18) + Math.abs(g - 36) + Math.abs(b - 24) > 60) nonBg++;
-      if (b > r + 30 && b > 100) bluish++;
-    }
-    return { sx, sy, bluish, nonBg, unit: st.unitPos };
-  });
-  if (pixelCheck && !pixelCheck.error) {
-    console.log(`[verify] 像素检查: 单位屏幕(${pixelCheck.sx.toFixed(0)}, ${pixelCheck.sy.toFixed(0)}) 非背景=${pixelCheck.nonBg} 蓝调=${pixelCheck.bluish}`);
-    if (pixelCheck.bluish < 100) {
-      console.error('[verify] 单位区域蓝调像素过少，单位可能未正确绘制/贴地！');
-      result = 'errors';
-    }
-  } else {
-    console.warn(`[verify] 像素检查跳过: ${pixelCheck?.error ?? 'unknown'}`);
-  }
 
   // —— 面板统计 ——
   const stats = await page.evaluate(() => {
@@ -197,44 +201,6 @@ try {
   });
   console.log('[verify] 面板统计:');
   for (const row of stats ?? []) console.log('   ' + row);
-
-  // —— 7 动作播放验证（需求 9.1：待机/移动/转向/攻击/格挡/受击/死亡） ——
-  const states = ['idle', 'walk', 'attack', 'block', 'hit', 'turn', 'death'];
-  let animOk = true;
-  for (const state of states) {
-    await page.evaluate((s) => {
-      const scene = window.__battleScene;
-      scene.debugReset();
-      scene.debugPlay(s);
-    }, state);
-    await new Promise((r) => setTimeout(r, 150));
-    const st = await probe(page);
-    if (st && st.animState === state) {
-      console.log(`[verify] 动作 ${state} ✓`);
-    } else {
-      console.error(`[verify] 动作 ${state} 未进入（实际 ${st?.animState ?? '无场景'}）`);
-      animOk = false;
-    }
-  }
-  if (!animOk) result = 'errors';
-  await page.evaluate(() => window.__battleScene.debugReset());
-
-  // —— 攻击命中触发打击感特效（需求 9.2：命中帧后飘字存活） ——
-  await page.evaluate(() => {
-    window.__battleScene.debugReset();
-    window.__battleScene.debugPlay('attack');
-  });
-  await new Promise((r) => setTimeout(r, 560)); // 命中帧 0.45s + 0.11s（飘字 0.85s 内仍存活）
-  const fxProbe = await probe(page);
-  if (fxProbe) {
-    if (fxProbe.fxActive >= 1) {
-      console.log(`[verify] 命中特效: 活动特效数=${fxProbe.fxActive} (飘字/火花已触发 ✓)`);
-    } else {
-      console.error('[verify] 命中帧未触发特效（fxActive=0）！');
-      result = 'errors';
-    }
-  }
-  await page.evaluate(() => window.__battleScene.debugReset());
 
   if (consoleErrors.length > 0) {
     result = 'errors';

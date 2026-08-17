@@ -7,7 +7,7 @@
  * 阶段 5（多单位性能专题）在此基础上扩展同纹理合批、纹理图集合并与对象池。
  */
 import { Rectangle, Sprite, Texture } from 'pixi.js';
-import type { RigDef } from '../art/rig';
+import type { RigDef } from '../anim/dragonbones';
 import type { BakedAtlas } from '../art/bake';
 
 /** 图集 → 部件名 → Pixi 子纹理 */

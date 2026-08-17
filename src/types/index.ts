@@ -12,8 +12,8 @@ export interface Vec2 {
 /** 阵营：0 = 蓝方（己方），1 = 红方（敌方） */
 export type TeamId = 0 | 1;
 
-/** 基础兵种类型（阶段 4 起扩展弓箭手等） */
-export type UnitKind = 'spearman';
+/** 兵种类型（由各兵种数据在 data/ 注册；类型即兵种 id 字符串） */
+export type UnitKind = string;
 
 /** 单位基础属性 */
 export interface UnitStats {

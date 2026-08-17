@@ -114,6 +114,12 @@ export interface ArmatureData {
   animation: AnimationData[];
 }
 
+/** 程序化装配定义（通用契约）：骨骼 + 部件槽位绑定 */
+export interface RigDef {
+  bones: BoneData[];
+  slots: SlotData[];
+}
+
 export interface SkeletonData {
   name: string;
   frameRate?: number;
