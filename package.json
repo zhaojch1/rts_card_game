@@ -9,7 +9,6 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@rive-app/canvas": "^2.40.0",
     "phaser": "^4.0.0"
   },
   "devDependencies": {

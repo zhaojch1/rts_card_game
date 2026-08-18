@@ -8,13 +8,13 @@
 - **目标**：基于 Phaser 4 的卡牌驱动 RTS 游戏（皇室战争类：出牌召唤单位，自动战斗）
 - **当前进度**：已完成第一个完整单位「暗影长枪兵」——纯代码绘制的立绘 + 完整动画系统（待机 / 行走 / 攻击 / 受击 / 死亡），以及可交互的玩法 demo
 - **技术栈**：Vite 6 + TypeScript + Phaser 4.0.0
-- **美术策略**：目前**全部用代码绘制**（AI 出图一致性差，已封存，见第九节）
+- **美术策略**：全部用代码绘制（曾尝试 AI 出图，一致性差，已废弃并清理）
 
 ## 二、快速开始
 
 ```bash
 npm install
-npm run dev      # 打开 http://localhost:5173（默认玩法 demo）
+npm run dev      # 打开 http://localhost:5173（玩法 demo）
 npm run build    # 类型检查 + 生产构建
 ```
 
@@ -22,22 +22,16 @@ npm run build    # 类型检查 + 生产构建
 | 参数 | 作用 |
 |---|---|
 | （无） | 玩法 demo（长枪兵完整动画） |
-| `?rive` | Rive 技术验证页（封存的美术路线） |
 | `?auto` | demo 自动演示（自动攻击 + 自动处决） |
 
 ## 三、目录结构
 
 ```
 src/
-├── main.ts              # 入口：Phaser 配置 + 场景切换
+├── main.ts              # 入口：Phaser 配置
 ├── DemoScene.ts         # ★ 玩法 demo：单位逻辑 + 动画状态机
-├── art/
-│   └── spearman.ts      # ★ 核心渲染模块：长枪兵 + 史莱姆的代码绘制
-└── RiveSpikeScene.ts    # 封存：Rive 集成技术验证页
-docs/art-prompts.md      # 封存：AI 出图提示词规范
-scripts/gen-art.mjs      # 封存：豆包/火山方舟文生图脚本
-.env                     # 封存：AI API Key（已 gitignore，勿提交）
-public/rive/             # 封存：Rive 示例动画
+└── art/
+    └── spearman.ts      # ★ 核心渲染模块：长枪兵 + 史莱姆的代码绘制
 ```
 
 **核心依赖关系**：`main.ts` → `DemoScene.ts` → `art/spearman.ts`（渲染层完全独立，不依赖场景）。
@@ -216,20 +210,9 @@ spearAimLean(u, t) = Clamp(atan2(dx/d, -dy/d), 0.2, 1.7)
 1. **Phaser 4 没有默认导出**：必须 `import * as Phaser from 'phaser'`（v3 的 `import Phaser from 'phaser'` 会构建失败）
 2. **Graphics 没有 `quadraticCurveTo`**；`fillPoints`/`strokeEllipse`/`fillRoundedRect` 等都在
 3. **画布变换**（`save/translateCanvas/scaleCanvas/rotateCanvas/restore`）是"整幅画旋转/镜像"的唯一干净方案，别逐点算坐标
-4. **豆包 Seedream API**：一次只出一张（`n` 无效）；无视 `response_format` 永远返回 **JPEG**（用魔数识别）；出图要"纯白底"便于抠图
-5. **cdn.rive.app 在本网络 TLS 被干扰**（PowerShell/curl 失败，Node fetch 成功）——下载外网素材优先用 Node fetch
-6. **AI 美术的一致性问题是硬伤**（同角色跨图走形）→ 本项目改用代码绘制；将来要换真美术，走 Rive 骨骼绑定（已验证可行）
-7. **攻击距离 = 武器几何**：单位交战距离必须由"枪尖实际位置"推导，否则出现"贴脸戳空气"的假动作
+4. **攻击距离 = 武器几何**：单位交战距离必须由"枪尖实际位置"推导，否则出现"贴脸戳空气"的假动作
 
-## 九、封存 / 可选路径（别删，随时可恢复）
-
-| 路径 | 位置 | 状态 |
-|---|---|---|
-| Rive 骨骼动画 | `?rive` 页 + `@rive-app/canvas` | 已验证 Phaser4 集成可行，等真实美术时启用 |
-| AI 出图管线 | `scripts/gen-art.mjs` + `docs/art-prompts.md` + `.env` | 火山方舟 API 已跑通，一致性差所以暂停 |
-| 选型场景 | ~~VariantPickerScene~~ | 设计已定稿（v5），已删除 |
-
-## 十、下一步（主线）
+## 九、下一步（主线）
 
 1. **游戏内核**（纯 TS，不依赖 Phaser）：卡牌/能量/手牌系统、战场（双路+塔）、单位数据配置化、简单 AI
 2. 把长枪兵作为第一张牌接入内核
