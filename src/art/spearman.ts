@@ -1,7 +1,7 @@
 import * as Phaser from 'phaser';
 
 /**
- * 共享美术模块：长枪兵（侧身暗黑系 v5 定稿）+ 史莱姆靶子
+ * 共享美术模块：长枪兵（侧身暗黑系 v5 定稿）+ 共享调色板/腿部/混色
  * 动画全部由参数驱动，配合 Graphics 画布变换（平移/镜像/旋转）实现完整动作：
  *  - bob      竖直弹跳（走路/呼吸）
  *  - rot      整体旋转（绕脚点；攻击前倾、死亡倒下）
@@ -49,6 +49,19 @@ const CAPE_DARK = 0x10141a;
 const CAPE_LIGHT = 0x1e232b;
 const BOOT = 0x0a0d11;
 
+/** 共享调色板：供其它兵种（如剑士）复用同一套暗色铠甲风格 */
+export const PALETTE = {
+  BODY,
+  BODY_HI,
+  BODY_DARK,
+  OUTLINE,
+  SKIN,
+  HELMET,
+  CAPE_DARK,
+  CAPE_LIGHT,
+  BOOT,
+};
+
 export const SPEAR_LEN = 172; // ≈ 身高的 2.2 倍
 export const SPEAR_LEAN = 0.17; // 基础前倾 ~10°
 
@@ -63,8 +76,8 @@ export const SPEARMAN_FINAL: SpearmanConfig = {
   spearLen: SPEAR_LEN,
 };
 
-/** 颜色插值（闪白用） */
-function mix(a: number, b: number, t: number): number {
+/** 颜色插值（闪白用），共享给所有代码绘制的兵种 */
+export function mix(a: number, b: number, t: number): number {
   const ar = (a >> 16) & 255;
   const ag = (a >> 8) & 255;
   const ab = a & 255;
@@ -77,6 +90,47 @@ function mix(a: number, b: number, t: number): number {
       Math.round(ab + (bb - ab) * t)) >>>
     0
   );
+}
+
+/**
+ * 共享：士兵腿部（站立单腿 / 行走·战斗姿态双腿一前一后）。
+ * 长枪兵、剑士等所有"人形兵种"复用同一套腿部绘制。
+ */
+export function drawSoldierLegs(g: Phaser.GameObjects.Graphics, legCol: number, swing: number) {
+  if (Math.abs(swing) > 0.12) {
+    // 后腿（远侧）：相位相反，更深、略靠后
+    const bs = -swing * 0.85;
+    const bl = Math.max(0, -swing) * 0.7;
+    const bfx = -1.5 + bs * 9;
+    const bfy = -2 - bl * 3;
+    g.lineStyle(9, 0x0d1014, 1);
+    g.beginPath();
+    g.moveTo(-1.5, -16);
+    g.lineTo(bfx, bfy);
+    g.strokePath();
+    g.fillStyle(0x07090c, 1);
+    g.fillRoundedRect(bfx - 5, bfy - 4, 13, 5, 2.5);
+    // 前腿（近侧）
+    const fl = Math.max(0, swing) * 0.7;
+    const ffx = 1.5 + swing * 9;
+    const ffy = -2 - fl * 3;
+    g.lineStyle(11, legCol, 1);
+    g.beginPath();
+    g.moveTo(1.5, -16);
+    g.lineTo(ffx, ffy);
+    g.strokePath();
+    g.fillStyle(BOOT, 1);
+    g.fillRoundedRect(ffx - 5, ffy - 4, 14, 6, 2.5);
+  } else {
+    // 站立：一条腿
+    g.lineStyle(11, legCol, 1);
+    g.beginPath();
+    g.moveTo(0, -16);
+    g.lineTo(0, -2);
+    g.strokePath();
+    g.fillStyle(BOOT, 1);
+    g.fillRoundedRect(-5, -6, 14, 6, 2.5);
+  }
 }
 
 export function drawSpearman(g: Phaser.GameObjects.Graphics, c: SpearmanConfig, anim: SpearmanAnim = {}) {
@@ -103,41 +157,7 @@ export function drawSpearman(g: Phaser.GameObjects.Graphics, c: SpearmanConfig, 
   const by = -30;
 
   // ---- 腿：站立一条腿；行走/战斗姿态两条腿一前一后（远侧深色、相位相反）----
-  const swing = anim.legSwing ?? 0;
-  if (Math.abs(swing) > 0.12) {
-    // 后腿（远侧）：相位相反，更深、略靠后
-    const bs = -swing * 0.85;
-    const bl = Math.max(0, -swing) * 0.7;
-    const bfx = -1.5 + bs * 9;
-    const bfy = -2 - bl * 3;
-    g.lineStyle(9, 0x0d1014, 1);
-    g.beginPath();
-    g.moveTo(-1.5, -16);
-    g.lineTo(bfx, bfy);
-    g.strokePath();
-    g.fillStyle(0x07090c, 1);
-    g.fillRoundedRect(bfx - 5, bfy - 4, 13, 5, 2.5);
-    // 前腿（近侧）
-    const fl = Math.max(0, swing) * 0.7;
-    const ffx = 1.5 + swing * 9;
-    const ffy = -2 - fl * 3;
-    g.lineStyle(11, bodyDarkCol, 1);
-    g.beginPath();
-    g.moveTo(1.5, -16);
-    g.lineTo(ffx, ffy);
-    g.strokePath();
-    g.fillStyle(BOOT, 1);
-    g.fillRoundedRect(ffx - 5, ffy - 4, 14, 6, 2.5);
-  } else {
-    // 站立：一条腿
-    g.lineStyle(11, bodyDarkCol, 1);
-    g.beginPath();
-    g.moveTo(0, -16);
-    g.lineTo(0, -2);
-    g.strokePath();
-    g.fillStyle(BOOT, 1);
-    g.fillRoundedRect(-5, -6, 14, 6, 2.5);
-  }
+  drawSoldierLegs(g, bodyDarkCol, anim.legSwing ?? 0);
 
   // ---- 躯干（侧面，修长）----
   g.fillStyle(bodyCol, 1);
@@ -364,41 +384,3 @@ function drawHelmet(g: Phaser.GameObjects.Graphics, c: SpearmanConfig, bx: numbe
   }
 }
 
-// ---------------- 史莱姆靶子 ----------------
-
-export interface SlimeAnim {
-  squash?: number; // 纵向挤压（受击/死亡）
-  stretch?: number; // 横向拉伸
-  flash?: number; // 受击闪白（秒）
-  alpha?: number;
-}
-
-export function drawSlime(g: Phaser.GameObjects.Graphics, anim: SlimeAnim = {}) {
-  g.clear();
-  g.setAlpha(anim.alpha ?? 1);
-  const squash = anim.squash ?? 1;
-  const stretch = anim.stretch ?? 1;
-  const flash = Math.min(1, Math.max(0, anim.flash ?? 0) * 5); // 0.2s 内闪白
-  const bodyCol = mix(0xe8555a, 0xffffff, flash);
-
-  g.fillStyle(bodyCol, 1);
-  // 中心随挤压下沉，让底部始终贴地
-  g.fillEllipse(0, -14 * squash, 34 * stretch, 26 * squash);
-  // 暗红轮廓
-  g.lineStyle(2, 0x6e1a20, 1);
-  g.strokeEllipse(0, -14 * squash, 34 * stretch, 26 * squash);
-
-  if (flash < 0.5) {
-    g.fillStyle(0xff9aa0, 1);
-    g.fillEllipse(-8 * stretch, -20 * squash, 10 * stretch, 6 * squash);
-  }
-  g.fillStyle(0x222222, 1);
-  g.fillCircle(-6 * stretch, -16 * squash, 2.2);
-  g.fillCircle(6 * stretch, -16 * squash, 2.2);
-  g.lineStyle(2, 0x222222, 1);
-  g.beginPath();
-  g.moveTo(-6 * stretch, -8 * squash);
-  g.lineTo(-2 * stretch, -6 * squash);
-  g.lineTo(2 * stretch, -8 * squash);
-  g.strokePath();
-}
