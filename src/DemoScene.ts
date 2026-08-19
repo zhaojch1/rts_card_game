@@ -67,10 +67,10 @@ const BLOCK_CD = 2.0; // 格挡冷却（秒）：格挡成功后必须等这段�
 const SPEAR_KNOCK_TIME = 0.35; // 长枪被弹开的姿态时长（秒）
 
 // ---- 底部卡牌召唤 ----
-const CARD_W = 110;
-const CARD_H = 84;
-const CARD_Y_OFFSET = 52; // 卡牌中心距底部的距离（增加以容纳更厚的底板）
-const SPAWN_Y_OFFSET = 114; // 生成点：卡牌上方
+const CARD_W = 120;
+const CARD_H = 90;
+const CARD_Y_OFFSET = 56; // 卡牌中心距底部的距离（增加以容纳更厚的底板）
+const SPAWN_Y_OFFSET = 120; // 生成点：卡牌上方
 const CARD_CD = 0.8; // 卡牌冷却（秒）
 const MAX_UNITS = 24; // 场上单位上限
 
@@ -152,10 +152,19 @@ interface CardDef {
 export class DemoScene extends Phaser.Scene {
   private units: Unit[] = [];
   private selected: Unit | null = null;
+  private selectedUnits: Unit[] = []; // 框选的单位数组
   private cards: CardDef[] = [];
   private cardGfx!: Phaser.GameObjects.Graphics;
   private barGfx!: Phaser.GameObjects.Graphics; // 木质底板（静态，只绘制一次）
-  private cardTexts: Phaser.GameObjects.Text[] = [];
+  private hoveredCard: CardDef | null = null; // 悬停的卡牌
+  
+  // 框选相关变量
+  private isSelecting: boolean = false;
+  private selectStartX: number = 0;
+  private selectStartY: number = 0;
+  private selectEndX: number = 0;
+  private selectEndY: number = 0;
+  private selectGfx!: Phaser.GameObjects.Graphics;
 
   constructor() {
     super('demo');
@@ -198,23 +207,12 @@ export class DemoScene extends Phaser.Scene {
     this.drawWoodenBar(W, H);
 
     this.cardGfx = this.add.graphics().setDepth(50);
-    for (const c of this.cards) {
-      const st = UNIT_TYPES[c.kind];
-      this.cardTexts.push(
-        this.add
-          .text(c.x, c.y - 20, st.name, {
-            fontFamily: 'Georgia, "Times New Roman", serif',
-            fontSize: '15px',
-            color: '#e8d8c8',
-            stroke: '#000000',
-            strokeThickness: 4,
-          })
-          .setOrigin(0.5)
-          .setDepth(51)
-      );
-    }
+    // 注意：卡牌文本现在在drawCards函数中动态创建，这里不再重复创建
+    
+    // 初始化框选图形
+    this.selectGfx = this.add.graphics().setDepth(100);
 
-    // 左键：卡牌召唤 → 点敌方单位下令攻击 → 点单位选中；右键：移动/选单位
+    // 左键：卡牌召唤 → 框选单位 → 点单位选中；右键：移动/选单位
     this.input.on('pointerdown', (pointer: Phaser.Input.Pointer) => {
       if (pointer.button === 0) {
         const card = this.cardAt(pointer.x, pointer.y);
@@ -222,34 +220,89 @@ export class DemoScene extends Phaser.Scene {
           this.spawnFromCard(card);
           return;
         }
+        
+        // 开始框选
+        this.isSelecting = true;
+        this.selectStartX = pointer.x;
+        this.selectStartY = pointer.y;
+        this.selectEndX = pointer.x;
+        this.selectEndY = pointer.y;
+        
+        // 点击单位选中
         const hit = this.pickUnit(pointer.x, pointer.y);
         if (hit) {
-          const sel = this.selected;
-          // 已选中单位 + 点击敌方单位 → 下令攻击该目标（长枪兵点剑士 → 开战）
-          if (sel && sel.alive && sel !== hit && sel.stats.team !== hit.stats.team) {
-            this.orderAttack(sel, hit);
-            return;
-          }
           this.selected = hit;
+          this.selectedUnits = [hit];
         } else {
           this.selected = null;
+          this.selectedUnits = [];
         }
       } else if (pointer.button === 2) {
         // 右键点中单位 → 选中它（容错：不要求先左键点选）
         const hit = this.pickUnit(pointer.x, pointer.y);
         if (hit) {
           this.selected = hit;
+          this.selectedUnits = [hit];
           return;
         }
         // 右键空地 → 选中的单位立刻停止战斗，移动到点击处
         // （移动到位后恢复自动索敌 → 自动发起攻击）
-        const u = this.selected;
-        if (u && u.alive) {
-          u.state = 'moving';
-          u.moveTarget = { x: pointer.x, y: pointer.y };
+        const unitsToMove = this.selectedUnits.length > 0 ? this.selectedUnits : 
+                           (this.selected ? [this.selected] : []);
+        
+        for (const u of unitsToMove) {
+          if (u && u.alive) {
+            u.state = 'moving';
+            u.moveTarget = { x: pointer.x, y: pointer.y };
+            u.target = null;
+            u.holdFire = false; // 转移后允许自动参战
+            // 打断战斗：approach 阶段武器没放平直接回 none，否则收武器复位
+            if (u.combat.phase === 'level' || u.combat.phase === 'stab') {
+              u.combat.phase = 'recover';
+              u.combat.t = 0;
+            } else if (u.combat.phase === 'approach') {
+              u.combat.phase = 'none';
+              u.combat.t = 0;
+            }
+          }
+        }
+      }
+    });
+    
+    // 鼠标移动事件，用于框选和悬停
+    this.input.on('pointermove', (pointer: Phaser.Input.Pointer) => {
+      this.hoveredCard = this.cardAt(pointer.x, pointer.y);
+      
+      if (this.isSelecting) {
+        this.selectEndX = pointer.x;
+        this.selectEndY = pointer.y;
+        this.updateSelection();
+      }
+    });
+    
+    // 鼠标释放事件，结束框选
+    this.input.on('pointerup', (pointer: Phaser.Input.Pointer) => {
+      if (pointer.button === 0 && this.isSelecting) {
+        this.isSelecting = false;
+        this.selectGfx.clear();
+      }
+    });
+    
+    document.addEventListener('contextmenu', (e) => e.preventDefault());
+
+    window.addEventListener('keydown', (e) => {
+      const k = e.key.toLowerCase();
+      if (k === 'v') {
+        // V：立即停止攻击 —— 清指令、解除目标、收武器复位，并挂起自动索敌
+        const unitsToControl = this.selectedUnits.length > 0 ? this.selectedUnits : 
+                              (this.selected ? [this.selected] : []);
+        
+        for (const u of unitsToControl) {
+          if (!u || !u.alive) continue;
+          u.state = 'idle';
+          u.moveTarget = null;
           u.target = null;
-          u.holdFire = false; // 转移后允许自动参战
-          // 打断战斗：approach 阶段武器没放平直接回 none，否则收武器复位
+          u.holdFire = true;
           if (u.combat.phase === 'level' || u.combat.phase === 'stab') {
             u.combat.phase = 'recover';
             u.combat.t = 0;
@@ -257,42 +310,37 @@ export class DemoScene extends Phaser.Scene {
             u.combat.phase = 'none';
             u.combat.t = 0;
           }
+          this.spawnDamageText(u.pos.x, u.pos.y - 96, '停止', '#9fd8c0');
         }
-      }
-    });
-    document.addEventListener('contextmenu', (e) => e.preventDefault());
-
-    window.addEventListener('keydown', (e) => {
-      const k = e.key.toLowerCase();
-      if (k === 'v') {
-        // V：立即停止攻击 —— 清指令、解除目标、收武器复位，并挂起自动索敌
-        const u = this.selected;
-        if (!u || !u.alive) return;
-        u.state = 'idle';
-        u.moveTarget = null;
-        u.target = null;
-        u.holdFire = true;
-        if (u.combat.phase === 'level' || u.combat.phase === 'stab') {
-          u.combat.phase = 'recover';
-          u.combat.t = 0;
-        } else if (u.combat.phase === 'approach') {
-          u.combat.phase = 'none';
-          u.combat.t = 0;
-        }
-        this.spawnDamageText(u.pos.x, u.pos.y - 96, '停止', '#9fd8c0');
       }
       if (k === 'a') {
         // A：重新开始攻击（解除 holdFire）
-        const u = this.selected;
-        if (!u || !u.alive) return;
-        u.holdFire = false;
-        this.orderAttack(u);
-        this.spawnDamageText(u.pos.x, u.pos.y - 96, '攻击', '#ffd166');
+        const unitsToControl = this.selectedUnits.length > 0 ? this.selectedUnits : 
+                              (this.selected ? [this.selected] : []);
+        
+        for (const u of unitsToControl) {
+          if (!u || !u.alive) continue;
+          u.holdFire = false;
+          this.orderAttack(u);
+          this.spawnDamageText(u.pos.x, u.pos.y - 96, '攻击', '#ffd166');
+        }
       }
       if (k === 'k') {
-        const u = this.selected;
-        if (u && u.alive && u.anim.mode !== 'die') this.killUnit(u);
+        // K：处决选中的单位
+        const unitsToKill = this.selectedUnits.length > 0 ? this.selectedUnits : 
+                           (this.selected ? [this.selected] : []);
+        
+        for (const u of unitsToKill) {
+          if (u && u.alive && u.anim.mode !== 'die') this.killUnit(u);
+        }
+        this.selected = null;
+        this.selectedUnits = [];
       }
+    });
+
+    // 添加鼠标移动事件，用于卡牌悬停效果
+    this.input.on('pointermove', (pointer: Phaser.Input.Pointer) => {
+      this.hoveredCard = this.cardAt(pointer.x, pointer.y);
     });
   }
 
@@ -336,6 +384,12 @@ export class DemoScene extends Phaser.Scene {
       const px = u.pos.x;
       const py = u.pos.y;
       if (u.state === 'moving' && u.moveTarget) {
+        // 边界检查：确保移动目标不会进入卡牌栏区域
+        const maxY = this.scale.height - BAR_HEIGHT - 10; // 卡牌栏上方10px
+        if (u.moveTarget.y > maxY) {
+          u.moveTarget.y = maxY;
+        }
+        
         const dx = u.moveTarget.x - u.pos.x;
         const dy = u.moveTarget.y - u.pos.y;
         const d = Math.hypot(dx, dy);
@@ -406,12 +460,20 @@ export class DemoScene extends Phaser.Scene {
     const st = UNIT_TYPES[kind];
     const gfx = this.add.graphics().setDepth(10);
     const hpBar = this.add.graphics().setDepth(12);
+    
+    // 确保生成位置不会在卡牌栏下方
+    const maxY = this.scale.height - BAR_HEIGHT - 20;
+    const safePos = {
+      x: pos.x,
+      y: Math.min(pos.y, maxY)
+    };
+    
     const u: Unit = {
       kind,
       stats: st,
       gfx,
       hpBar,
-      pos: { ...pos },
+      pos: { ...safePos },
       hp: st.hp,
       state: 'idle',
       holdFire: false,
@@ -441,12 +503,21 @@ export class DemoScene extends Phaser.Scene {
     if (card.cooldown > 0) return;
     if (this.units.filter((u) => !u.done).length >= MAX_UNITS) return;
     card.cooldown = CARD_CD;
-    const u = this.spawnUnit(card.kind, { x: card.x, y: this.scale.height - SPAWN_Y_OFFSET });
+    
+    // 修改：从屏幕左边生成单位，而不是从卡牌上方
+    const spawnX = 50; // 屏幕左边50px处
+    const maxY = this.scale.height - BAR_HEIGHT - 50; // 卡牌栏上方50px
+    const spawnY = Math.min(this.scale.height / 2, maxY); // 确保不超过卡牌栏
+    const u = this.spawnUnit(card.kind, { x: spawnX, y: spawnY });
+    
     this.selected = u;
+    this.selectedUnits = [u];
     this.spawnPoof(u.pos.x, u.pos.y - 4);
     this.spawnDamageText(u.pos.x, u.pos.y - 120, UNIT_TYPES[card.kind].name, '#ffd166');
-    const e = this.nearestEnemyInRange(u, u.stats.aggro);
-    if (e) this.orderAttack(u);
+    
+    // 不再自动攻击，因为同阵营不互相攻击
+    // const e = this.nearestEnemyInRange(u, u.stats.aggro);
+    // if (e) this.orderAttack(u);
   }
 
   /** 下令攻击：可指定目标（点敌方单位），不指定则自动找最近敌人 */
@@ -633,7 +704,12 @@ export class DemoScene extends Phaser.Scene {
       // （keepRange 允许长枪兵在射程内任意距离出枪；是否收枪由 updateAttack 的 spearTooClose 判定）。
       // 不能倒退：敌人移速更快时倒退永远到不了理想距离，会被一路追着打
       const pastIdeal = u.facingRight ? u.pos.x >= targetX : u.pos.x <= targetX;
-      if (pastIdeal) return true;
+      // 修复：长枪兵需要同时满足以下条件才认为到位：
+      // 1. X轴距离合适（pastIdeal）
+      // 2. Y轴对齐良好（dy < 6） - 与精确对齐条件一致
+      // 这样可以避免在垂直方向上距离较远时直接进入level状态导致"往上戳空气"
+      // 同时保持贴脸逻辑不变（贴脸判定在approachTarget之前执行）
+      if (pastIdeal && dy < 6) return true;
       const stepX = Math.min(u.stats.speed * dt, dx - AIM_BAND);
       u.pos.x += u.facingRight ? stepX : -stepX;
     }
@@ -1106,12 +1182,13 @@ export class DemoScene extends Phaser.Scene {
     g.fillRoundedRect(x - 1.5, y - 1.5, w + 3, h + 3, 2.5);
     g.lineStyle(1.5, 0xffffff, 0.35);
     g.strokeRoundedRect(x - 1.5, y - 1.5, w + 3, h + 3, 2.5);
-    // 血量（A 方长枪兵 = 绿，B 方剑士 = 红）
+    // 血量（统一为绿色，因为都是A阵营）
     const pct = Phaser.Math.Clamp(u.hp / u.stats.hp, 0, 1);
-    g.fillStyle(u.stats.team === 'a' ? 0x66cc66 : 0xe8555a, 1);
+    g.fillStyle(0x66cc66, 1); // 统一绿色
     g.fillRoundedRect(x, y, Math.max(0.01, w * pct), h, 1.5);
     // 默认不显示，选中才显示（死亡时透明度由 updateDeath 接管）
-    g.setAlpha(u === this.selected ? 1 : 0);
+    const isSelected = this.selectedUnits.includes(u) || u === this.selected;
+    g.setAlpha(isSelected ? 1 : 0);
   }
 
   // ---------- 木质卡牌底板 ----------
@@ -1312,7 +1389,10 @@ export class DemoScene extends Phaser.Scene {
 
   private cardAt(x: number, y: number): CardDef | null {
     for (const c of this.cards) {
-      if (Math.abs(x - c.x) <= CARD_W / 2 && Math.abs(y - c.y) <= CARD_H / 2) return c;
+      // 增加点击检测区域，提供更好的交互体验
+      const hitW = CARD_W / 2 + 5;
+      const hitH = CARD_H / 2 + 5;
+      if (Math.abs(x - c.x) <= hitW && Math.abs(y - c.y) <= hitH) return c;
     }
     return null;
   }
@@ -1323,57 +1403,144 @@ export class DemoScene extends Phaser.Scene {
     for (const c of this.cards) {
       const accent = c.kind === 'spearman' ? 0x3fe0c0 : 0xe07a3a;
       const accentDark = c.kind === 'spearman' ? 0x2aa088 : 0xb86028;
+      const accentLight = c.kind === 'spearman' ? 0x7fffe0 : 0xffb366;
       const x = c.x - CARD_W / 2;
       const y = c.y - CARD_H / 2;
+      
+      // 检查是否悬停
+      const isHovered = this.hoveredCard === c;
+      const isClickable = c.cooldown <= 0;
 
-      // 卡牌阴影（营造浮在皮革上的效果）
-      g.fillStyle(0x000000, 0.6);
-      g.fillRoundedRect(x + 2, y + 3, CARD_W, CARD_H, 8);
+      // 卡牌阴影（营造浮在皮革上的效果，多层阴影更立体）
+      g.fillStyle(0x000000, 0.4);
+      g.fillRoundedRect(x + 3, y + 4, CARD_W, CARD_H, 8);
+      g.fillStyle(0x000000, 0.2);
+      g.fillRoundedRect(x + 1, y + 2, CARD_W, CARD_H, 8);
+      
+      // 悬停效果：发光边框和提升效果
+      if (isHovered && isClickable) {
+        g.fillStyle(accent, 0.15);
+        g.fillRoundedRect(x - 2, y - 2, CARD_W + 4, CARD_H + 4, 10);
+        g.lineStyle(3, accent, 0.8);
+        g.strokeRoundedRect(x - 2, y - 2, CARD_W + 4, CARD_H + 4, 10);
+      }
 
-      // 卡底（羊皮纸质感）
+      // 卡底（羊皮纸质感，多层渐变）
       g.fillStyle(0x1a1e28, 0.97);
       g.fillRoundedRect(x, y, CARD_W, CARD_H, 8);
+      
+      // 内发光效果（营造深度感）
+      g.fillStyle(accent, isHovered && isClickable ? 0.1 : 0.05);
+      g.fillRoundedRect(x + 2, y + 2, CARD_W - 4, CARD_H - 4, 6);
 
-      // 卡牌内纹理（细微横向条纹，模拟纸张）
-      g.lineStyle(0.5, 0x2a2e38, 0.3);
-      for (let i = 0; i < 8; i++) {
-        const lineY = y + 10 + i * 10;
+      // 卡牌内纹理（更细腻的网格纹理，模拟羊皮纸）
+      g.lineStyle(0.3, 0x2a2e38, 0.25);
+      // 横向纹理
+      for (let i = 0; i < 9; i++) {
+        const lineY = y + 8 + i * 9;
         g.beginPath();
-        g.moveTo(x + 6, lineY);
-        g.lineTo(x + CARD_W - 6, lineY);
+        g.moveTo(x + 5, lineY);
+        g.lineTo(x + CARD_W - 5, lineY);
+        g.strokePath();
+      }
+      // 纵向纹理（增加纸张质感）
+      for (let i = 0; i < 6; i++) {
+        const lineX = x + 15 + i * 18;
+        g.beginPath();
+        g.moveTo(lineX, y + 5);
+        g.lineTo(lineX, y + CARD_H - 5);
         g.strokePath();
       }
 
-      // 顶部 accent 色带
+      // 顶部 accent 色带（带渐变效果）
       g.fillStyle(accentDark, 0.9);
-      g.fillRoundedRect(x, y, CARD_W, 6, { tl: 8, tr: 8, bl: 0, br: 0 });
+      g.fillRoundedRect(x, y, CARD_W, 8, { tl: 8, tr: 8, bl: 0, br: 0 });
+      // 色带高光
+      g.fillStyle(accentLight, 0.3);
+      g.fillRoundedRect(x + 2, y + 1, CARD_W - 4, 3, { tl: 6, tr: 6, bl: 0, br: 0 });
 
-      // accent 描边（金属感）
-      g.lineStyle(2, accent, 0.95);
+      // accent 描边（金属感，双层描边更精致）
+      g.lineStyle(2.5, accent, 0.95);
       g.strokeRoundedRect(x, y, CARD_W, CARD_H, 8);
+      // 内层细描边（增加层次感）
+      g.lineStyle(1, accentLight, 0.4);
+      g.strokeRoundedRect(x + 2, y + 2, CARD_W - 4, CARD_H - 4, 6);
 
-      // 内部装饰线
-      g.lineStyle(1, accent, 0.3);
-      g.strokeRoundedRect(x + 4, y + 4, CARD_W - 8, CARD_H - 8, 6);
+      // 内部装饰线（更精致的边框）
+      g.lineStyle(1.5, accent, 0.35);
+      g.strokeRoundedRect(x + 5, y + 5, CARD_W - 10, CARD_H - 10, 5);
+      // 角落装饰点
+      const cornerSize = 3;
+      g.fillStyle(accent, 0.6);
+      g.fillCircle(x + 10, y + 10, cornerSize);
+      g.fillCircle(x + CARD_W - 10, y + 10, cornerSize);
+      g.fillCircle(x + 10, y + CARD_H - 10, cornerSize);
+      g.fillCircle(x + CARD_W - 10, y + CARD_H - 10, cornerSize);
 
       // 图标（迷你武器剪影）
-      this.drawCardIcon(g, c.kind, c.x, c.y + 10, accent);
+      this.drawCardIcon(g, c.kind, c.x, c.y + 12, accent);
 
-      // 冷却遮罩 + 恢复条
+      // 兵种名称（更精致的字体效果）
+      const st = UNIT_TYPES[c.kind];
+      this.add
+        .text(c.x, c.y - 22, st.name, {
+          fontFamily: '"华文行楷", "STXingkai", Georgia, "Times New Roman", serif',
+          fontSize: '16px',
+          color: '#f0e6d6',
+          stroke: '#000000',
+          strokeThickness: 4,
+          shadow: {
+            offsetX: 1,
+            offsetY: 1,
+            color: '#000000',
+            blur: 2,
+            fill: true
+          }
+        })
+        .setOrigin(0.5)
+        .setDepth(51);
+
+      // 冷却遮罩 + 恢复条（更精美的冷却效果）
       if (c.cooldown > 0) {
         const k = c.cooldown / CARD_CD;
-        // 冷却遮罩（更深）
-        g.fillStyle(0x000000, 0.65 * k);
+        // 冷却遮罩（更深，带渐变）
+        g.fillStyle(0x000000, 0.7 * k);
         g.fillRoundedRect(x, y, CARD_W, CARD_H, 8);
-        // 恢复条背景
-        g.fillStyle(0x000000, 0.5);
-        g.fillRoundedRect(x + 6, y + CARD_H - 14, CARD_W - 12, 6, 3);
-        // 恢复条（发光效果）
+        
+        // 恢复条背景（带边框）
+        g.fillStyle(0x000000, 0.6);
+        g.fillRoundedRect(x + 8, y + CARD_H - 16, CARD_W - 16, 8, 4);
+        g.lineStyle(1, 0x333333, 0.8);
+        g.strokeRoundedRect(x + 8, y + CARD_H - 16, CARD_W - 16, 8, 4);
+        
+        // 恢复条（发光效果，带渐变）
+        const barWidth = (CARD_W - 16) * (1 - k);
         g.fillStyle(accent, 0.9);
-        g.fillRoundedRect(x + 6, y + CARD_H - 14, (CARD_W - 12) * (1 - k), 6, 3);
-        // 恢复条高光
-        g.fillStyle(0xffffff, 0.4 * (1 - k));
-        g.fillRoundedRect(x + 6, y + CARD_H - 14, (CARD_W - 12) * (1 - k), 3, { tl: 3, tr: 3, bl: 0, br: 0 });
+        g.fillRoundedRect(x + 8, y + CARD_H - 16, barWidth, 8, 4);
+        
+        // 恢复条高光（更明显的发光）
+        g.fillStyle(0xffffff, 0.5 * (1 - k));
+        g.fillRoundedRect(x + 8, y + CARD_H - 16, barWidth, 4, { tl: 4, tr: 4, bl: 0, br: 0 });
+        
+        // 恢复条发光点（动态效果）
+        if (barWidth > 10) {
+          g.fillStyle(0xffffff, 0.8 * (1 - k));
+          g.fillCircle(x + 8 + barWidth - 4, y + CARD_H - 12, 2);
+        }
+        
+        // 冷却时间数字（更清晰的显示）
+        const cdText = Math.ceil(c.cooldown * 10) / 10;
+        this.add
+          .text(c.x, c.y + 20, `${cdText}s`, {
+            fontFamily: 'Arial, sans-serif',
+            fontSize: '12px',
+            color: '#ffffff',
+            stroke: '#000000',
+            strokeThickness: 3,
+          })
+          .setOrigin(0.5)
+          .setDepth(52)
+          .setAlpha(0.9);
       }
     }
   }
@@ -1381,49 +1548,154 @@ export class DemoScene extends Phaser.Scene {
   private drawCardIcon(g: Phaser.GameObjects.Graphics, kind: UnitKind, cx: number, cy: number, accent: number) {
     g.save();
     g.translateCanvas(cx, cy);
-    g.rotateCanvas(-0.5); // 斜放更有动感
+    g.rotateCanvas(-0.4); // 斜放更有动感
+    
     if (kind === 'spearman') {
-      // 迷你长枪
-      g.lineStyle(3, 0xd0d6de, 1);
+      // 精致长枪图标
+      // 枪杆（带渐变效果）
+      g.lineStyle(4, 0x8a9aa8, 1);
+      g.beginPath();
+      g.moveTo(-20, 22);
+      g.lineTo(16, -18);
+      g.strokePath();
+      
+      // 枪杆高光
+      g.lineStyle(2, 0xb8c8d8, 0.7);
       g.beginPath();
       g.moveTo(-18, 20);
       g.lineTo(14, -16);
       g.strokePath();
+      
+      // 枪头（更精致的菱形）
       g.fillStyle(0xd0d6de, 1);
-      g.fillTriangle(18, -22, 12, -11, 25, -14);
-      g.lineStyle(2, accent, 1);
+      g.fillTriangle(20, -24, 14, -13, 26, -16);
+      // 枪头高光
+      g.fillStyle(0xffffff, 0.6);
+      g.fillTriangle(18, -22, 15, -15, 22, -18);
+      
+      // 枪缨（accent色装饰）
+      g.lineStyle(2, accent, 0.9);
       g.beginPath();
-      g.moveTo(-10, 23);
-      g.lineTo(10, 3);
+      g.moveTo(-12, 25);
+      g.lineTo(12, 5);
       g.strokePath();
+      // 枪缨装饰点
+      g.fillStyle(accent, 0.8);
+      g.fillCircle(-8, 22, 2);
+      g.fillCircle(8, 8, 2);
+      
     } else {
-      // 迷你剑 + 迷你圆盾（剑士特征：剑盾组合）
-      g.lineStyle(4, 0xc8cfd8, 1);
+      // 精致剑盾图标
+      // 剑身（带渐变效果）
+      g.lineStyle(5, 0xa0a8b0, 1);
+      g.beginPath();
+      g.moveTo(0, -24);
+      g.lineTo(0, 14);
+      g.strokePath();
+      
+      // 剑身高光
+      g.lineStyle(2, 0xd0d8e0, 0.8);
       g.beginPath();
       g.moveTo(0, -22);
       g.lineTo(0, 12);
       g.strokePath();
-      g.lineStyle(2, 0x6a4a2a, 1);
+      
+      // 剑柄（更精致）
+      g.lineStyle(3, 0x6a4a2a, 1);
       g.beginPath();
-      g.moveTo(-8, 2);
-      g.lineTo(8, 2);
+      g.moveTo(-10, 4);
+      g.lineTo(10, 4);
       g.strokePath();
+      
+      // 剑柄装饰
+      g.fillStyle(0x8a6a3a, 1);
+      g.fillCircle(-8, 4, 2);
+      g.fillCircle(8, 4, 2);
+      
+      // 剑柄底部
       g.fillStyle(0x5a4630, 1);
-      g.fillCircle(0, 16, 2.6);
-      // 圆盾（右侧）
-      g.fillStyle(0x232a33, 1);
-      g.fillCircle(16, 6, 9);
-      g.lineStyle(1.6, accent, 1);
-      g.strokeCircle(16, 6, 9);
+      g.fillCircle(0, 18, 3);
+      g.fillStyle(0x7a6640, 1);
+      g.fillCircle(0, 18, 2);
+      
+      // 圆盾（更精致的盾牌）
+      // 盾牌主体
+      g.fillStyle(0x2a323a, 1);
+      g.fillCircle(18, 6, 10);
+      
+      // 盾牌边框（accent色）
+      g.lineStyle(2, accent, 0.95);
+      g.strokeCircle(18, 6, 10);
+      
+      // 盾牌装饰（十字纹）
+      g.lineStyle(1.5, accent, 0.7);
+      g.beginPath();
+      g.moveTo(18, -2);
+      g.lineTo(18, 14);
+      g.strokePath();
+      g.beginPath();
+      g.moveTo(10, 6);
+      g.lineTo(26, 6);
+      g.strokePath();
+      
+      // 盾牌中心凸起
       g.fillStyle(accent, 0.9);
-      g.fillCircle(16, 6, 3);
+      g.fillCircle(18, 6, 4);
+      g.fillStyle(0xffffff, 0.5);
+      g.fillCircle(17, 5, 1.5);
+      
+      // 盾牌高光
+      g.fillStyle(0xffffff, 0.3);
+      g.fillCircle(16, 4, 2);
     }
+    
     g.restore();
+  }
+
+  // ---------- 框选 ----------
+  
+  private updateSelection() {
+    // 绘制框选矩形
+    this.selectGfx.clear();
+    this.selectGfx.lineStyle(2, 0x00ff00, 0.8);
+    this.selectGfx.strokeRect(
+      Math.min(this.selectStartX, this.selectEndX),
+      Math.min(this.selectStartY, this.selectEndY),
+      Math.abs(this.selectEndX - this.selectStartX),
+      Math.abs(this.selectEndY - this.selectStartY)
+    );
+    
+    // 计算框选区域，确保不超出卡牌栏边界
+    const left = Math.min(this.selectStartX, this.selectEndX);
+    const right = Math.max(this.selectStartX, this.selectEndX);
+    const top = Math.min(this.selectStartY, this.selectEndY);
+    const bottom = Math.min(
+      Math.max(this.selectStartY, this.selectEndY),
+      this.scale.height - BAR_HEIGHT - 10 // 卡牌栏上方10px
+    );
+    
+    // 选择框内的单位
+    this.selectedUnits = [];
+    for (const u of this.units) {
+      if (!u.alive || u.anim.mode === 'die') continue;
+      if (u.pos.x >= left && u.pos.x <= right && u.pos.y >= top && u.pos.y <= bottom) {
+        this.selectedUnits.push(u);
+      }
+    }
+    
+    // 如果有选中的单位，设置第一个为当前选中单位
+    if (this.selectedUnits.length > 0) {
+      this.selected = this.selectedUnits[0];
+    }
   }
 
   // ---------- 拾取 ----------
 
   private pickUnit(x: number, y: number): Unit | null {
+    // 确保不会选择到卡牌栏下方的单位
+    const maxY = this.scale.height - BAR_HEIGHT - 10;
+    if (y > maxY) return null;
+    
     for (let i = this.units.length - 1; i >= 0; i--) {
       const u = this.units[i];
       if (!u.alive || u.anim.mode === 'die') continue;

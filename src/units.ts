@@ -53,11 +53,11 @@ export const UNIT_TYPES: Record<UnitKind, UnitStats> = {
   spearman: {
     kind: 'spearman',
     name: '长矛兵',
-    team: 'a',
+    team: 'a', // 统一为A阵营
     hp: 100,
     speed: 230,
     damage: 18,
-    aggro: 900,
+    aggro: 0, // 关闭自动索敌，同阵营不互相攻击
     retreatFactor: 0.7, // 长枪兵的 keepRange 对"太近"不后退（见 DemoScene）；贴脸应对是后撤步，此项对长枪兵无效
     handX: 9,
     handY: -28,
@@ -73,11 +73,11 @@ export const UNIT_TYPES: Record<UnitKind, UnitStats> = {
   swordsman: {
     kind: 'swordsman',
     name: '剑士',
-    team: 'b',
+    team: 'a', // 统一为A阵营
     hp: 170,
     speed: 280,
     damage: 24, // 攻击更高；对长枪兵还有 1.5 倍加成（见 DemoScene applyHit）
-    aggro: 900,
+    aggro: 0, // 关闭自动索敌，同阵营不互相攻击
     retreatFactor: 0.7,
     handX: 10,
     handY: -36,
