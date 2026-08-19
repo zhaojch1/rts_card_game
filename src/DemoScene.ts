@@ -46,17 +46,25 @@ const KNOCKBACK_MAX = 10; // 上限：敌人贴身时不会被一下打飞太远
 const CRIT_MULT = 3;
 const CRIT_CHANCE = 0.5;
 
+// ---- 长枪兵特性：后撤步 ----
+// 被近身后可以发动一次快速后退拉开距离，有冷却时间防止无限后退
+const RETREAT_DIST = 60; // 后退距离（像素）
+const RETREAT_SPEED_MULT = 2.5; // 后退速度倍率（快速拉开）
+const RETREAT_CD = 10.0; // 后撤冷却（秒）
+const RETREAT_DURATION = 0.2; // 后撤动画时长（秒）
+
 // ---- 剑士特性：盾牌格挡 ----
 // 被攻击时有 30% 概率用圆盾挡住；格挡后攻击者的长枪被弹开（进入收枪恢复/非战斗状态）
 const BLOCK_CHANCE = 0.3;
 const BLOCK_TIME = 0.5; // 格挡姿态时长（秒）
+const BLOCK_CD = 2.0; // 格挡冷却（秒）：格挡成功后必须等这段时间才能再次格挡，防止多单位连续格挡
 const SPEAR_KNOCK_TIME = 0.35; // 长枪被弹开的姿态时长（秒）
 
 // ---- 底部卡牌召唤 ----
 const CARD_W = 110;
 const CARD_H = 84;
-const CARD_Y = 676;
-const SPAWN_Y = 614; // 生成点：卡牌上方
+const CARD_Y_OFFSET = 44; // 卡牌中心距底部的距离
+const SPAWN_Y_OFFSET = 106; // 生成点：卡牌上方
 const CARD_CD = 0.8; // 卡牌冷却（秒）
 const MAX_UNITS = 24; // 场上单位上限
 
@@ -73,7 +81,7 @@ interface Vec {
 }
 
 type AnimMode = 'idle' | 'walk' | 'hurt' | 'die';
-type CombatPhase = 'none' | 'level' | 'stab' | 'recover';
+type CombatPhase = 'none' | 'approach' | 'level' | 'stab' | 'recover';
 
 interface Unit {
   kind: UnitKind;
@@ -93,10 +101,18 @@ interface Unit {
   flash: number;
   /** 剑士格挡姿态剩余时间（>0 时盾牌举起护身） */
   blockT: number;
+  /** 剑士格挡冷却剩余时间（>0 时无法格挡，防止多单位连续格挡） */
+  blockCD: number;
   /** 长枪兵长枪被格挡弹开的姿态剩余时间（>0 时枪被弹向上方） */
   spearKnock: number;
   /** 长枪兵对当前目标的暴击是否已打出（换目标后重置，下一次命中即暴击） */
   critUsed: boolean;
+  /** 长枪兵后撤步冷却剩余时间（>0 时无法再次后撤） */
+  retreatCD: number;
+  /** 长枪兵后撤步动画剩余时间（>0 时正在后退） */
+  retreatT: number;
+  /** 后撤步锁定方向（1 = 向右退，-1 = 向左退，触发时锁定不再变化） */
+  retreatDir: 1 | -1;
   anim: {
     mode: AnimMode;
     t: number;
@@ -134,18 +150,21 @@ export class DemoScene extends Phaser.Scene {
   create() {
     console.log('[Demo] Phaser version =', Phaser.VERSION);
 
+    const W = this.scale.width;
+    const H = this.scale.height;
+
     const grid = this.add.graphics().setDepth(-1);
     grid.lineStyle(1, 0xffffff, 0.07);
-    for (let x = 0; x <= 1280; x += 64) {
+    for (let x = 0; x <= W; x += 64) {
       grid.beginPath();
       grid.moveTo(x, 0);
-      grid.lineTo(x, 720);
+      grid.lineTo(x, H);
       grid.strokePath();
     }
-    for (let y = 0; y <= 720; y += 64) {
+    for (let y = 0; y <= H; y += 64) {
       grid.beginPath();
       grid.moveTo(0, y);
-      grid.lineTo(1280, y);
+      grid.lineTo(W, y);
       grid.strokePath();
     }
 
@@ -154,9 +173,10 @@ export class DemoScene extends Phaser.Scene {
     // 对战测试：场上初始为空，从底部卡牌召唤双方兵种（长枪兵 A 方 vs 剑士 B 方）
 
     // 底部卡牌栏（点击召唤）
+    const cardY = H - CARD_Y_OFFSET;
     this.cards = [
-      { kind: 'spearman', x: 560, y: CARD_Y, cooldown: 0 },
-      { kind: 'swordsman', x: 720, y: CARD_Y, cooldown: 0 },
+      { kind: 'spearman', x: W / 2 - 80, y: cardY, cooldown: 0 },
+      { kind: 'swordsman', x: W / 2 + 80, y: cardY, cooldown: 0 },
     ];
     this.cardGfx = this.add.graphics().setDepth(50);
     for (const c of this.cards) {
@@ -210,9 +230,12 @@ export class DemoScene extends Phaser.Scene {
           u.moveTarget = { x: pointer.x, y: pointer.y };
           u.target = null;
           u.holdFire = false; // 转移后允许自动参战
-          // 打断战斗：缓慢收武器复位
+          // 打断战斗：approach 阶段武器没放平直接回 none，否则收武器复位
           if (u.combat.phase === 'level' || u.combat.phase === 'stab') {
             u.combat.phase = 'recover';
+            u.combat.t = 0;
+          } else if (u.combat.phase === 'approach') {
+            u.combat.phase = 'none';
             u.combat.t = 0;
           }
         }
@@ -232,6 +255,9 @@ export class DemoScene extends Phaser.Scene {
         u.holdFire = true;
         if (u.combat.phase === 'level' || u.combat.phase === 'stab') {
           u.combat.phase = 'recover';
+          u.combat.t = 0;
+        } else if (u.combat.phase === 'approach') {
+          u.combat.phase = 'none';
           u.combat.t = 0;
         }
         this.spawnDamageText(u.pos.x, u.pos.y - 96, '停止', '#9fd8c0');
@@ -270,7 +296,14 @@ export class DemoScene extends Phaser.Scene {
       u.walkPhase += dt * (a.mode === 'walk' ? 7 : 1.2);
       if (u.flash > 0) u.flash -= dt;
       if (u.blockT > 0) u.blockT -= dt; // 剑士格挡姿态倒计时
+      if (u.blockCD > 0) u.blockCD -= dt; // 剑士格挡冷却倒计时
       if (u.spearKnock > 0) u.spearKnock -= dt; // 长枪被弹开姿态倒计时
+      if (u.retreatCD > 0) u.retreatCD -= dt; // 后撤步冷却倒计时
+      if (u.retreatT > 0) {
+        // 后撤步动画：沿锁定方向快速后退
+        u.retreatT -= dt;
+        u.pos.x += u.retreatDir * u.stats.speed * RETREAT_SPEED_MULT * dt;
+      }
       if (a.mode === 'hurt' && a.t >= HURT_TOTAL) a.mode = 'idle';
 
       // 索敌：双方兵种自动参战（仅空闲且未挂起时；V 停止后不再自动参战，
@@ -308,9 +341,15 @@ export class DemoScene extends Phaser.Scene {
       {
         const cb = u.combat;
         // 脱离战斗（被右键打断/目标全灭）→ 收武器复位
-        if (u.state !== 'attacking' && (cb.phase === 'level' || cb.phase === 'stab')) {
-          cb.phase = 'recover';
-          cb.t = 0;
+        // approach 阶段武器还没放平，直接回 none；level/stab 需要 recover 收武器
+        if (u.state !== 'attacking') {
+          if (cb.phase === 'level' || cb.phase === 'stab') {
+            cb.phase = 'recover';
+            cb.t = 0;
+          } else if (cb.phase === 'approach') {
+            cb.phase = 'none';
+            cb.t = 0;
+          }
         }
         if (cb.phase === 'recover') {
           cb.t += dt;
@@ -364,8 +403,12 @@ export class DemoScene extends Phaser.Scene {
       alive: true,
       flash: 0,
       blockT: 0,
+      blockCD: 0,
       spearKnock: 0,
       critUsed: false,
+      retreatCD: 0,
+      retreatT: 0,
+      retreatDir: 1,
       anim: { mode: 'idle', t: 0, poofed: false },
       combat: { phase: 'none', t: 0, hitThisCycle: false, lastLean: st.restLean, lastX: 0, lastRot: 0 },
       done: false,
@@ -379,7 +422,7 @@ export class DemoScene extends Phaser.Scene {
     if (card.cooldown > 0) return;
     if (this.units.filter((u) => !u.done).length >= MAX_UNITS) return;
     card.cooldown = CARD_CD;
-    const u = this.spawnUnit(card.kind, { x: card.x, y: SPAWN_Y });
+    const u = this.spawnUnit(card.kind, { x: card.x, y: this.scale.height - SPAWN_Y_OFFSET });
     this.selected = u;
     this.spawnPoof(u.pos.x, u.pos.y - 4);
     this.spawnDamageText(u.pos.x, u.pos.y - 120, UNIT_TYPES[card.kind].name, '#ffd166');
@@ -402,9 +445,9 @@ export class DemoScene extends Phaser.Scene {
 
   /**
    * 战斗算法（所有近战兵种通用）：
-   * 1) 放平武器（level）：进入战斗先把武器压向瞄准角
-   * 2) 保持武器尖距离：太远前进、太近后退、合适才刺
-   * 3) 突刺循环（stab）：反复"回缩→刺出"，伤害在刺出中段（武器尖命中目标）结算
+   * 1) approach：先移动到敌人同一水平线 + 合适攻击距离（面对敌人）
+   * 2) level：原地放平武器瞄准（不移动）
+   * 3) stab：突刺/挥砍循环，微调距离
    */
   private updateAttack(u: Unit, dt: number) {
     const cb = u.combat;
@@ -424,27 +467,45 @@ export class DemoScene extends Phaser.Scene {
 
     const t = u.target;
 
-    // 长枪兵被贴脸 = 敌人进入了**它自己的攻击范围**（如剑士的攻击带外沿 ≈35px）：
-    // 长枪兵无法出枪，还原回非战斗姿势（收枪复位），不再自动后退。
-    // 只在 level/stab 时触发一次，之后让 recover 走完回到 none（枪回到待机位）
+    // 长枪兵被贴脸 = 敌人进入了**它自己的攻击范围**：
+    // 后撤冷却好了 → 发动后撤步快速拉开距离；
+    // 冷却中 → recover 收枪，站着不动（不再反复后退）。
     const enemyReach = this.tipAtHit(t) - PENETRATION + AIM_BAND;
     const spearTooClose = u.kind === 'spearman' && this.handToAimDist(u, t) < enemyReach;
     if (spearTooClose && (cb.phase === 'level' || cb.phase === 'stab')) {
+      if (u.retreatCD <= 0 && u.retreatT <= 0) {
+        // 发动后撤步：一次性快速后退拉开距离
+        u.retreatCD = RETREAT_CD;
+        u.retreatT = RETREAT_DURATION;
+        u.retreatDir = u.facingRight ? -1 : 1; // 锁定后退方向，不再随 facingRight 变化
+      }
+      // 无论是否发动后撤，都立即 recover（冷却中站着挨打，冷却好了后撤完也老实站）
       cb.phase = 'recover';
       cb.t = 0;
       return;
     }
 
-    // 进入战斗先摆平武器
+    // 进入战斗 → 先接近敌人到合适位置
     if (cb.phase === 'none') {
       if (spearTooClose) return; // 贴脸中不重新摆枪
-      cb.phase = 'level';
+      cb.phase = 'approach';
       cb.t = 0;
     }
+
+    // ---- approach：移动到敌人同一水平线 + 合适攻击距离 ----
+    if (cb.phase === 'approach') {
+      u.facingRight = t.pos.x >= u.pos.x;
+      const arrived = this.approachTarget(u, t, dt);
+      if (arrived) {
+        cb.phase = 'level';
+        cb.t = 0;
+      }
+      return;
+    }
+
+    // ---- level：原地放平武器瞄准（不移动）----
     if (cb.phase === 'level') {
       cb.t += dt;
-      // 摆平过程中也在移动调整距离
-      this.keepRange(u, t, dt);
       if (cb.t >= LEVEL_TIME) {
         cb.phase = 'stab';
         cb.t = 0;
@@ -453,7 +514,7 @@ export class DemoScene extends Phaser.Scene {
       return;
     }
 
-    // 突刺循环
+    // ---- stab：突刺/挥砍循环，微调距离 ----
     if (cb.phase === 'stab') {
       const range = this.keepRange(u, t, dt);
       if (u.kind === 'spearman') {
@@ -476,6 +537,51 @@ export class DemoScene extends Phaser.Scene {
         }
       }
     }
+  }
+
+  /**
+   * 接近目标：移动到与敌人同一水平线（Y 对齐），并保持合适攻击距离。
+   * 长枪兵：先 Y 对齐 → 再 X 方向调整到枪尖刚好够到敌人的距离。
+   * 剑士：先 Y 对齐 → 再 X 方向靠近到挥剑距离。
+   * 返回 true = 已到位，可以开始放平武器。
+   */
+  private approachTarget(u: Unit, t: Unit, dt: number): boolean {
+    u.facingRight = t.pos.x >= u.pos.x;
+
+    // 目标位置：与敌人同一水平线，保持攻击距离
+    const ideal = this.tipAtHit(u) - (u.kind === 'spearman' ? 0 : PENETRATION);
+    const targetX = u.facingRight ? t.pos.x - ideal : t.pos.x + ideal;
+    const targetY = t.pos.y; // Y 轴对齐到敌人脚下
+
+    // 分两步：先对齐 Y，再对齐 X（Y 优先，因为上下错位是主要问题）
+    const dy = Math.abs(u.pos.y - targetY);
+    const dx = Math.abs(u.pos.x - targetX);
+
+    // 容差：Y 差距 < 6px 且 X 差距在 AIM_BAND 范围内 → 到位
+    if (dy < 6 && dx <= AIM_BAND) {
+      u.pos.y = targetY; // 精确对齐
+      return true;
+    }
+
+    // 先解决 Y 差距（移动到同一水平线）
+    if (dy >= 6) {
+      const stepY = Math.min(u.stats.speed * dt, dy);
+      u.pos.y += u.pos.y < targetY ? stepY : -stepY;
+    } else if (u.kind !== 'spearman') {
+      // Y 已对齐，调整 X 距离（剑士：前进或后退都允许）
+      const stepX = Math.min(u.stats.speed * dt, Math.max(0, dx - AIM_BAND));
+      u.pos.x += u.pos.x < targetX ? stepX : -stepX;
+    } else {
+      // 长枪兵：Y 已对齐，只允许前进靠近敌人，不允许后退
+      // 如果已经太近（dx 很小），就停在原地等 level/stab 处理
+      const tooClose = dx <= AIM_BAND;
+      if (!tooClose) {
+        const stepX = Math.min(u.stats.speed * dt, dx - AIM_BAND);
+        u.pos.x += u.pos.x < targetX ? stepX : -stepX;
+      }
+    }
+
+    return false;
   }
 
   /** "手→目标中心"距离（与 keepRange 同口径） */
@@ -553,8 +659,10 @@ export class DemoScene extends Phaser.Scene {
 
     // 剑士特性：格挡 —— 30% 概率用圆盾挡住这次攻击（不扣血、不进受击、不被击退）
     // 格挡后攻击者的长枪被弹开 → 长枪兵收枪恢复（非战斗状态），要重新蓄力才能再刺
-    if (t.kind === 'swordsman' && Math.random() < BLOCK_CHANCE) {
+    // 格挡有冷却（BLOCK_CD）：格挡成功后必须等冷却结束才能再次格挡，防止多单位连续格挡超模
+    if (t.kind === 'swordsman' && t.blockCD <= 0 && Math.random() < BLOCK_CHANCE) {
       t.blockT = BLOCK_TIME;
+      t.blockCD = BLOCK_CD; // 进入格挡冷却，期间无法再次格挡
       this.spawnPoof(t.pos.x + 10 * (t.facingRight ? 1 : -1), t.pos.y - 48);
       this.spawnDamageText(t.pos.x, t.pos.y - t.stats.targetCenter * 2 - 16, '格挡', '#9fd8c0');
       if (u.combat.phase === 'level' || u.combat.phase === 'stab') {

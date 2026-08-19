@@ -3,10 +3,14 @@ import { DemoScene } from './DemoScene';
 
 const config = {
   parent: 'game',
-  width: 1280,
-  height: 720,
+  width: window.innerWidth,
+  height: window.innerHeight,
   backgroundColor: '#8fbf7f',
   scene: [DemoScene],
+  scale: {
+    mode: Phaser.Scale.RESIZE,
+    autoCenter: Phaser.Scale.CENTER_BOTH,
+  },
 };
 
 new Phaser.Game(config);
