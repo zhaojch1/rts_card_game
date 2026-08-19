@@ -8,8 +8,8 @@ import { UNIT_TYPES, UnitKind, UnitStats } from './units';
  * - 底部卡牌栏：点击「长矛兵 / 剑士」卡牌 → 在卡牌上方生成对应兵种
  * - 点选单位后再点击敌方单位 → 对该目标发起攻击（也可自动索敌参战）
  * - 长枪兵：攻击距离长（枪尖刚碰到敌人就产生伤害）、命中击退、首击 50% 暴击；
- *   被贴脸（敌人进入它自己的攻击范围）则无法出枪 → 还原非战斗姿势，近战必死
- * - 剑士：移速快、攻击高、血厚，对长枪兵有 1.5 倍伤害加成，50% 概率盾牌格挡
+ *   被贴脸（敌人进入它自己的攻击范围）→ 后撤步拉开（10s 冷却，只触发一次）→ 收枪站桩挨打
+ * - 剑士：移速快、攻击高、血厚，对长枪兵有 1.5 倍伤害加成，30% 概率盾牌格挡
  *   （格挡后长枪兵的长枪被弹开，进入收枪恢复/非战斗状态）
  * - 伪3D 深度排序 + 同队软分离（跨队允许贴脸近战）
  *
@@ -47,11 +47,17 @@ const CRIT_MULT = 3;
 const CRIT_CHANCE = 0.5;
 
 // ---- 长枪兵特性：后撤步 ----
-// 被近身后可以发动一次快速后退拉开距离，有冷却时间防止无限后退
-const RETREAT_DIST = 60; // 后退距离（像素）
-const RETREAT_SPEED_MULT = 2.5; // 后退速度倍率（快速拉开）
-const RETREAT_CD = 10.0; // 后撤冷却（秒）
+// 被近身（敌人进入它自己的攻击范围）后发动一次快速后退拉开距离，有冷却时间防止无限后退；
+// 后退距离 = 移速 × RETREAT_SPEED_MULT × RETREAT_DURATION ≈ 184px（长枪兵 230 × 4.0 × 0.2）
+const RETREAT_SPEED_MULT = 4.0; // 后退速度倍率（快速拉开，从2.5提升到4.0）
+const RETREAT_CD = 8.0; // 后撤冷却（秒，从10降到8）
 const RETREAT_DURATION = 0.2; // 后撤动画时长（秒）
+
+// ---- 长枪兵特性：贴脸判定余量 ----
+// 贴脸判定用"我方手→敌人瞄准点"的距离，而敌人实际交战距离是"敌人自己的手→我方瞄准点"，
+// 参照点不同会差出 1~2px：若不加余量，剑士刚好停在阈值外时枪兵会误以为还能接近 → 在 approach
+// 里不断倒退（被更快的剑士一路追着打）。加 2px 余量让判定可靠覆盖敌人的实际攻击距离。
+const SPEAR_CLOSE_MARGIN = 2; // 贴脸判定余量（px）
 
 // ---- 剑士特性：盾牌格挡 ----
 // 被攻击时有 30% 概率用圆盾挡住；格挡后攻击者的长枪被弹开（进入收枪恢复/非战斗状态）
@@ -63,10 +69,17 @@ const SPEAR_KNOCK_TIME = 0.35; // 长枪被弹开的姿态时长（秒）
 // ---- 底部卡牌召唤 ----
 const CARD_W = 110;
 const CARD_H = 84;
-const CARD_Y_OFFSET = 44; // 卡牌中心距底部的距离
-const SPAWN_Y_OFFSET = 106; // 生成点：卡牌上方
+const CARD_Y_OFFSET = 52; // 卡牌中心距底部的距离（增加以容纳更厚的底板）
+const SPAWN_Y_OFFSET = 114; // 生成点：卡牌上方
 const CARD_CD = 0.8; // 卡牌冷却（秒）
 const MAX_UNITS = 24; // 场上单位上限
+
+// ---- 木质卡牌栏常量 ----
+const BAR_HEIGHT = 108; // 底板总高度
+const BAR_PADDING = 24; // 底板左右边距
+const METAL_STRIP_H = 4; // 金属装饰条高度
+const RIVET_RADIUS = 4; // 铆钉半径
+const LEATHER_INSET = 6; // 皮革凹槽内缩
 
 // ---- 伪3D 软分离（允许叠加，但缓慢隔开避免完全重叠）----
 const SEP_MIN = 30; // 期望最小间距（小于此值开始分离）
@@ -141,6 +154,7 @@ export class DemoScene extends Phaser.Scene {
   private selected: Unit | null = null;
   private cards: CardDef[] = [];
   private cardGfx!: Phaser.GameObjects.Graphics;
+  private barGfx!: Phaser.GameObjects.Graphics; // 木质底板（静态，只绘制一次）
   private cardTexts: Phaser.GameObjects.Text[] = [];
 
   constructor() {
@@ -178,17 +192,22 @@ export class DemoScene extends Phaser.Scene {
       { kind: 'spearman', x: W / 2 - 80, y: cardY, cooldown: 0 },
       { kind: 'swordsman', x: W / 2 + 80, y: cardY, cooldown: 0 },
     ];
+
+    // 绘制木质底板（静态，只需绘制一次）
+    this.barGfx = this.add.graphics().setDepth(48);
+    this.drawWoodenBar(W, H);
+
     this.cardGfx = this.add.graphics().setDepth(50);
     for (const c of this.cards) {
       const st = UNIT_TYPES[c.kind];
       this.cardTexts.push(
         this.add
-          .text(c.x, c.y - 16, st.name, {
-            fontFamily: 'Arial, sans-serif',
-            fontSize: '16px',
-            color: '#ffffff',
+          .text(c.x, c.y - 20, st.name, {
+            fontFamily: 'Georgia, "Times New Roman", serif',
+            fontSize: '15px',
+            color: '#e8d8c8',
             stroke: '#000000',
-            strokeThickness: 3,
+            strokeThickness: 4,
           })
           .setOrigin(0.5)
           .setDepth(51)
@@ -436,10 +455,17 @@ export class DemoScene extends Phaser.Scene {
     u.holdFire = false; // 下令攻击 = 解除挂起，允许自动索敌
     u.target = forcedTarget ?? this.nearestEnemy(u);
     u.critUsed = false; // 换目标 → 下一次命中是暴击
-    if (u.combat.phase === 'none' || u.combat.phase === 'recover') {
-      u.combat.phase = 'level';
-      u.combat.t = 0;
-      u.combat.hitThisCycle = false;
+    // 只有找到目标才进入战斗姿态，避免没有敌人时对着空气摆枪
+    if (u.target && u.target.alive) {
+      if (u.combat.phase === 'none' || u.combat.phase === 'recover') {
+        u.combat.phase = 'approach'; // 先接近，再放平武器
+        u.combat.t = 0;
+        u.combat.hitThisCycle = false;
+      }
+    } else {
+      // 没有目标：保持空闲，不进入战斗
+      u.state = 'idle';
+      u.target = null;
     }
   }
 
@@ -451,6 +477,9 @@ export class DemoScene extends Phaser.Scene {
    */
   private updateAttack(u: Unit, dt: number) {
     const cb = u.combat;
+
+    // 记录当前目标，用于检测目标切换
+    const prevTarget = u.target;
 
     if (!u.target || !u.target.alive) {
       u.target = this.nearestEnemy(u);
@@ -467,12 +496,35 @@ export class DemoScene extends Phaser.Scene {
 
     const t = u.target;
 
-    // 长枪兵被贴脸 = 敌人进入了**它自己的攻击范围**：
+    // 长枪兵被贴脸 = 敌人进入了**它自己的攻击范围**（+SPEAR_CLOSE_MARGIN 余量修正参照点差）：
     // 后撤冷却好了 → 发动后撤步快速拉开距离；
     // 冷却中 → recover 收枪，站着不动（不再反复后退）。
-    const enemyReach = this.tipAtHit(t) - PENETRATION + AIM_BAND;
+    const enemyReach = this.tipAtHit(t) - PENETRATION + AIM_BAND + SPEAR_CLOSE_MARGIN;
     const spearTooClose = u.kind === 'spearman' && this.handToAimDist(u, t) < enemyReach;
-    if (spearTooClose && (cb.phase === 'level' || cb.phase === 'stab')) {
+
+    // 目标切换检测：如果目标变了，必须重新走完整的攻击流程
+    // 避免转身时跳过 level（摆平武器）直接戳空气
+    const targetChanged = prevTarget !== t;
+    if (targetChanged && (cb.phase === 'level' || cb.phase === 'stab')) {
+      // 转身发现新目标很近 → 立即触发撤退（如果冷却好了）
+      if (spearTooClose) {
+        if (u.retreatCD <= 0 && u.retreatT <= 0) {
+          u.retreatCD = RETREAT_CD;
+          u.retreatT = RETREAT_DURATION;
+          u.retreatDir = u.facingRight ? -1 : 1;
+        }
+        cb.phase = 'recover';
+        cb.t = 0;
+        return;
+      }
+      // 目标不近 → 回到 approach 重新接近
+      cb.phase = 'approach';
+      cb.t = 0;
+      cb.hitThisCycle = false;
+    }
+
+    // 贴脸判定：覆盖 approach/level/stab 阶段
+    if (spearTooClose && (cb.phase === 'approach' || cb.phase === 'level' || cb.phase === 'stab')) {
       if (u.retreatCD <= 0 && u.retreatT <= 0) {
         // 发动后撤步：一次性快速后退拉开距离
         u.retreatCD = RETREAT_CD;
@@ -505,6 +557,8 @@ export class DemoScene extends Phaser.Scene {
 
     // ---- level：原地放平武器瞄准（不移动）----
     if (cb.phase === 'level') {
+      // 确保面对目标
+      u.facingRight = t.pos.x >= u.pos.x;
       cb.t += dt;
       if (cb.t >= LEVEL_TIME) {
         cb.phase = 'stab';
@@ -516,6 +570,8 @@ export class DemoScene extends Phaser.Scene {
 
     // ---- stab：突刺/挥砍循环，微调距离 ----
     if (cb.phase === 'stab') {
+      // 确保面对目标
+      u.facingRight = t.pos.x >= u.pos.x;
       const range = this.keepRange(u, t, dt);
       if (u.kind === 'spearman') {
         if (range === 'advance') return;
@@ -572,13 +628,14 @@ export class DemoScene extends Phaser.Scene {
       const stepX = Math.min(u.stats.speed * dt, Math.max(0, dx - AIM_BAND));
       u.pos.x += u.pos.x < targetX ? stepX : -stepX;
     } else {
-      // 长枪兵：Y 已对齐，只允许前进靠近敌人，不允许后退
-      // 如果已经太近（dx 很小），就停在原地等 level/stab 处理
-      const tooClose = dx <= AIM_BAND;
-      if (!tooClose) {
-        const stepX = Math.min(u.stats.speed * dt, dx - AIM_BAND);
-        u.pos.x += u.pos.x < targetX ? stepX : -stepX;
-      }
+      // 长枪兵：Y 已对齐，只允许"朝理想距离前进"，不允许倒退。
+      // 已比理想距离更近（pastIdeal，含目标在左侧的情况）→ 直接到位进入 level/stab 原地出枪
+      // （keepRange 允许长枪兵在射程内任意距离出枪；是否收枪由 updateAttack 的 spearTooClose 判定）。
+      // 不能倒退：敌人移速更快时倒退永远到不了理想距离，会被一路追着打
+      const pastIdeal = u.facingRight ? u.pos.x >= targetX : u.pos.x <= targetX;
+      if (pastIdeal) return true;
+      const stepX = Math.min(u.stats.speed * dt, dx - AIM_BAND);
+      u.pos.x += u.facingRight ? stepX : -stepX;
     }
 
     return false;
@@ -1015,7 +1072,7 @@ export class DemoScene extends Phaser.Scene {
         grip,
         capeSway,
         eyeGlow,
-        flash: 0,
+        flash: u.flash, // 受击闪白（0.18s 内衰减，见 applyHit）
       });
     } else {
       drawSwordsman(u.gfx, SWORDSMAN_FINAL, {
@@ -1030,7 +1087,7 @@ export class DemoScene extends Phaser.Scene {
         handLift,
         shieldBlock: shieldK,
         eyeGlow,
-        flash: 0,
+        flash: u.flash, // 受击闪白（0.18s 内衰减，见 applyHit）
       });
     }
     u.gfx.setPosition(u.pos.x, u.pos.y);
@@ -1057,6 +1114,200 @@ export class DemoScene extends Phaser.Scene {
     g.setAlpha(u === this.selected ? 1 : 0);
   }
 
+  // ---------- 木质卡牌底板 ----------
+
+  /**
+   * 绘制有质感的木质底部卡牌栏：
+   * - 深色实木底板（多层渐变模拟木纹）
+   * - 顶部/底部金属装饰条
+   * - 四角金属铆钉
+   * - 皮革内衬凹槽
+   * - 顶部高光和底部阴影
+   */
+  private drawWoodenBar(W: number, H: number) {
+    const g = this.barGfx;
+    const barY = H - BAR_HEIGHT;
+    const barX = BAR_PADDING;
+    const barW = W - BAR_PADDING * 2;
+
+    // ---- 底层阴影（营造悬浮感）----
+    g.fillStyle(0x000000, 0.5);
+    g.fillRoundedRect(barX + 3, barY + 5, barW, BAR_HEIGHT, 8);
+
+    // ---- 主木质底板 ----
+    // 基础深棕色木底
+    g.fillStyle(0x3d2b1f, 1);
+    g.fillRoundedRect(barX, barY, barW, BAR_HEIGHT, 8);
+
+    // 木纹纹理层1：横向条纹（深色）
+    g.fillStyle(0x2a1e14, 0.6);
+    for (let i = 0; i < 12; i++) {
+      const stripeY = barY + 8 + i * 8;
+      const stripeH = 2 + Math.sin(i * 0.8) * 1;
+      g.fillRect(barX + 4, stripeY, barW - 8, stripeH);
+    }
+
+    // 木纹纹理层2：横向亮纹（浅色，错位）
+    g.fillStyle(0x5a4232, 0.4);
+    for (let i = 0; i < 10; i++) {
+      const stripeY = barY + 12 + i * 10;
+      const stripeH = 1.5;
+      g.fillRect(barX + 6, stripeY, barW - 12, stripeH);
+    }
+
+    // 木纹纹理层3：斜向纹路（增加自然感）
+    g.lineStyle(1, 0x2a1e14, 0.3);
+    for (let i = 0; i < 6; i++) {
+      const startX = barX + 20 + i * 80;
+      g.beginPath();
+      g.moveTo(startX, barY + 10);
+      g.lineTo(startX + 40, barY + BAR_HEIGHT - 10);
+      g.strokePath();
+    }
+
+    // ---- 顶部高光（模拟光源从上方照射）----
+    g.fillStyle(0x6b5242, 0.5);
+    g.fillRoundedRect(barX, barY, barW, 15, { tl: 8, tr: 8, bl: 0, br: 0 });
+
+    // 渐变高光（更自然）
+    g.fillStyle(0x7a6352, 0.3);
+    g.fillRoundedRect(barX + 2, barY + 2, barW - 4, 8, { tl: 6, tr: 6, bl: 0, br: 0 });
+
+    // ---- 底部阴影（增加深度）----
+    g.fillStyle(0x1a1008, 0.6);
+    g.fillRoundedRect(barX, barY + BAR_HEIGHT - 12, barW, 12, { tl: 0, tr: 0, bl: 8, br: 8 });
+
+    // ---- 顶部金属装饰条 ----
+    const metalTopY = barY;
+    // 金属条主体（亮钢色）
+    g.fillStyle(0x8a9aa8, 1);
+    g.fillRect(barX + 8, metalTopY + 3, barW - 16, METAL_STRIP_H);
+    // 金属条高光
+    g.fillStyle(0xb8c8d8, 0.7);
+    g.fillRect(barX + 10, metalTopY + 3, barW - 20, 2);
+    // 金属条底部阴影
+    g.fillStyle(0x4a5a68, 0.8);
+    g.fillRect(barX + 8, metalTopY + METAL_STRIP_H + 1, barW - 16, 2);
+
+    // ---- 底部金属装饰条 ----
+    const metalBotY = barY + BAR_HEIGHT - METAL_STRIP_H - 4;
+    g.fillStyle(0x8a9aa8, 1);
+    g.fillRect(barX + 8, metalBotY, barW - 16, METAL_STRIP_H);
+    g.fillStyle(0xb8c8d8, 0.7);
+    g.fillRect(barX + 10, metalBotY, barW - 20, 2);
+    g.fillStyle(0x4a5a68, 0.8);
+    g.fillRect(barX + 8, metalBotY + METAL_STRIP_H, barW - 16, 2);
+
+    // ---- 四角金属铆钉 ----
+    const rivetPositions = [
+      { x: barX + 18, y: barY + 12 },
+      { x: barX + barW - 18, y: barY + 12 },
+      { x: barX + 18, y: barY + BAR_HEIGHT - 12 },
+      { x: barX + barW - 18, y: barY + BAR_HEIGHT - 12 },
+    ];
+
+    for (const pos of rivetPositions) {
+      // 铆钉阴影
+      g.fillStyle(0x000000, 0.5);
+      g.fillCircle(pos.x + 1, pos.y + 1, RIVET_RADIUS);
+      // 铆钉主体（金属色）
+      g.fillStyle(0x9aa8b8, 1);
+      g.fillCircle(pos.x, pos.y, RIVET_RADIUS);
+      // 铆钉高光（左上角）
+      g.fillStyle(0xd0e0f0, 0.8);
+      g.fillCircle(pos.x - 1.2, pos.y - 1.2, RIVET_RADIUS * 0.4);
+      // 铆钉阴影（右下角）
+      g.fillStyle(0x4a5a68, 0.6);
+      g.fillCircle(pos.x + 0.8, pos.y + 0.8, RIVET_RADIUS * 0.3);
+      // 铆钉外圈
+      g.lineStyle(1, 0x4a5a68, 0.8);
+      g.strokeCircle(pos.x, pos.y, RIVET_RADIUS);
+    }
+
+    // ---- 中间额外铆钉（装饰）----
+    const midRivets = [
+      { x: barX + barW * 0.25, y: barY + 12 },
+      { x: barX + barW * 0.5, y: barY + 12 },
+      { x: barX + barW * 0.75, y: barY + 12 },
+      { x: barX + barW * 0.25, y: barY + BAR_HEIGHT - 12 },
+      { x: barX + barW * 0.5, y: barY + BAR_HEIGHT - 12 },
+      { x: barX + barW * 0.75, y: barY + BAR_HEIGHT - 12 },
+    ];
+    for (const pos of midRivets) {
+      g.fillStyle(0x000000, 0.4);
+      g.fillCircle(pos.x + 1, pos.y + 1, 3);
+      g.fillStyle(0x8a9aa8, 1);
+      g.fillCircle(pos.x, pos.y, 3);
+      g.fillStyle(0xc0d0e0, 0.6);
+      g.fillCircle(pos.x - 0.8, pos.y - 0.8, 1.2);
+      g.lineStyle(0.8, 0x4a5a68, 0.7);
+      g.strokeCircle(pos.x, pos.y, 3);
+    }
+
+    // ---- 皮革内衬凹槽（卡牌放置区域）----
+    for (const c of this.cards) {
+      const leatherX = c.x - CARD_W / 2 - LEATHER_INSET;
+      const leatherY = c.y - CARD_H / 2 - LEATHER_INSET;
+      const leatherW = CARD_W + LEATHER_INSET * 2;
+      const leatherH = CARD_H + LEATHER_INSET * 2;
+
+      // 凹槽阴影（内凹效果）
+      g.fillStyle(0x0a0604, 0.7);
+      g.fillRoundedRect(leatherX, leatherY, leatherW, leatherH, 10);
+
+      // 皮革底色（深棕色）
+      g.fillStyle(0x2a1e14, 0.9);
+      g.fillRoundedRect(leatherX + 1, leatherY + 1, leatherW - 2, leatherH - 2, 9);
+
+      // 皮革纹理（细微颗粒感）
+      g.fillStyle(0x3a2e24, 0.3);
+      for (let i = 0; i < 20; i++) {
+        const px = leatherX + 4 + Math.random() * (leatherW - 8);
+        const py = leatherY + 4 + Math.random() * (leatherH - 8);
+        g.fillCircle(px, py, 1.5);
+      }
+
+      // 皮革边缘高光（上、左）
+      g.lineStyle(1.5, 0x4a3a2a, 0.5);
+      g.beginPath();
+      g.moveTo(leatherX + 4, leatherY + 2);
+      g.lineTo(leatherX + leatherW - 4, leatherY + 2);
+      g.strokePath();
+      g.beginPath();
+      g.moveTo(leatherX + 2, leatherY + 4);
+      g.lineTo(leatherX + 2, leatherY + leatherH - 4);
+      g.strokePath();
+
+      // 皮革边缘阴影（下、右）
+      g.lineStyle(1.5, 0x0a0604, 0.6);
+      g.beginPath();
+      g.moveTo(leatherX + 4, leatherY + leatherH - 2);
+      g.lineTo(leatherX + leatherW - 4, leatherY + leatherH - 2);
+      g.strokePath();
+      g.beginPath();
+      g.moveTo(leatherX + leatherW - 2, leatherY + 4);
+      g.lineTo(leatherX + leatherW - 2, leatherY + leatherH - 4);
+      g.strokePath();
+    }
+
+    // ---- 左右两侧金属装饰片 ----
+    const sideMetalW = 6;
+    // 左侧
+    g.fillStyle(0x7a8a98, 1);
+    g.fillRect(barX, barY + 15, sideMetalW, BAR_HEIGHT - 30);
+    g.fillStyle(0xa0b0c0, 0.5);
+    g.fillRect(barX, barY + 15, 2, BAR_HEIGHT - 30);
+    g.fillStyle(0x3a4a58, 0.6);
+    g.fillRect(barX + 4, barY + 15, 2, BAR_HEIGHT - 30);
+    // 右侧
+    g.fillStyle(0x7a8a98, 1);
+    g.fillRect(barX + barW - sideMetalW, barY + 15, sideMetalW, BAR_HEIGHT - 30);
+    g.fillStyle(0xa0b0c0, 0.5);
+    g.fillRect(barX + barW - 2, barY + 15, 2, BAR_HEIGHT - 30);
+    g.fillStyle(0x3a4a58, 0.6);
+    g.fillRect(barX + barW - 6, barY + 15, 2, BAR_HEIGHT - 30);
+  }
+
   // ---------- 底部卡牌 ----------
 
   private cardAt(x: number, y: number): CardDef | null {
@@ -1071,22 +1322,58 @@ export class DemoScene extends Phaser.Scene {
     g.clear();
     for (const c of this.cards) {
       const accent = c.kind === 'spearman' ? 0x3fe0c0 : 0xe07a3a;
+      const accentDark = c.kind === 'spearman' ? 0x2aa088 : 0xb86028;
       const x = c.x - CARD_W / 2;
       const y = c.y - CARD_H / 2;
-      // 卡底
-      g.fillStyle(0x14181f, 0.95);
-      g.fillRoundedRect(x, y, CARD_W, CARD_H, 10);
-      g.lineStyle(2, accent, 0.9);
-      g.strokeRoundedRect(x, y, CARD_W, CARD_H, 10);
+
+      // 卡牌阴影（营造浮在皮革上的效果）
+      g.fillStyle(0x000000, 0.6);
+      g.fillRoundedRect(x + 2, y + 3, CARD_W, CARD_H, 8);
+
+      // 卡底（羊皮纸质感）
+      g.fillStyle(0x1a1e28, 0.97);
+      g.fillRoundedRect(x, y, CARD_W, CARD_H, 8);
+
+      // 卡牌内纹理（细微横向条纹，模拟纸张）
+      g.lineStyle(0.5, 0x2a2e38, 0.3);
+      for (let i = 0; i < 8; i++) {
+        const lineY = y + 10 + i * 10;
+        g.beginPath();
+        g.moveTo(x + 6, lineY);
+        g.lineTo(x + CARD_W - 6, lineY);
+        g.strokePath();
+      }
+
+      // 顶部 accent 色带
+      g.fillStyle(accentDark, 0.9);
+      g.fillRoundedRect(x, y, CARD_W, 6, { tl: 8, tr: 8, bl: 0, br: 0 });
+
+      // accent 描边（金属感）
+      g.lineStyle(2, accent, 0.95);
+      g.strokeRoundedRect(x, y, CARD_W, CARD_H, 8);
+
+      // 内部装饰线
+      g.lineStyle(1, accent, 0.3);
+      g.strokeRoundedRect(x + 4, y + 4, CARD_W - 8, CARD_H - 8, 6);
+
       // 图标（迷你武器剪影）
       this.drawCardIcon(g, c.kind, c.x, c.y + 10, accent);
+
       // 冷却遮罩 + 恢复条
       if (c.cooldown > 0) {
         const k = c.cooldown / CARD_CD;
-        g.fillStyle(0x000000, 0.55 * k);
-        g.fillRoundedRect(x, y, CARD_W, CARD_H, 10);
-        g.fillStyle(0x9fd8c0, 0.9);
-        g.fillRect(x + 4, y + CARD_H - 8, (CARD_W - 8) * (1 - k), 3);
+        // 冷却遮罩（更深）
+        g.fillStyle(0x000000, 0.65 * k);
+        g.fillRoundedRect(x, y, CARD_W, CARD_H, 8);
+        // 恢复条背景
+        g.fillStyle(0x000000, 0.5);
+        g.fillRoundedRect(x + 6, y + CARD_H - 14, CARD_W - 12, 6, 3);
+        // 恢复条（发光效果）
+        g.fillStyle(accent, 0.9);
+        g.fillRoundedRect(x + 6, y + CARD_H - 14, (CARD_W - 12) * (1 - k), 6, 3);
+        // 恢复条高光
+        g.fillStyle(0xffffff, 0.4 * (1 - k));
+        g.fillRoundedRect(x + 6, y + CARD_H - 14, (CARD_W - 12) * (1 - k), 3, { tl: 3, tr: 3, bl: 0, br: 0 });
       }
     }
   }

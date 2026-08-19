@@ -58,7 +58,7 @@ export const UNIT_TYPES: Record<UnitKind, UnitStats> = {
     speed: 230,
     damage: 18,
     aggro: 900,
-    retreatFactor: 0.7, // 长枪兵被贴脸后不后退（keepRange 已跳过），此项对长枪兵无效
+    retreatFactor: 0.7, // 长枪兵的 keepRange 对"太近"不后退（见 DemoScene）；贴脸应对是后撤步，此项对长枪兵无效
     handX: 9,
     handY: -28,
     weaponLen: SPEAR_LEN,
